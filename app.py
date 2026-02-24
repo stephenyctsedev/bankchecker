@@ -80,9 +80,31 @@ if st.button("🚀 開始掃描並轉換", type="primary"):
                 # 2. Call Ollama
                 payload = {
                     "model": selected_model,
-                    "prompt": f"請從以下文本中提取所有利息收入項目，以 JSON 格式輸出：[{{'date': 'YYYY/MM/DD', 'description': '名稱', 'amount': 0.00}}]。文本：\n{md_text}",
+                    "prompt": f"""
+                    You are a professional bank auditor. Extract all "Interest Credit" entries from this statement.
+                    
+                    ### RULES:
+                    1. Look for keywords: "Interest", "INT", "CR", "利息", "存入利息".
+                    2. Identify the EXACT amount. Do NOT confuse "Balance" (large numbers) with "Interest" (small numbers).
+                    3. If the date format is inconsistent, normalize it to YYYY-MM-DD.
+                    4. RETURN ONLY A JSON ARRAY. No chat, no preamble.
+                    
+                    ### FORMAT EXAMPLE:
+                    [
+                      {{"date": "2024-04-30", "description": "INTEREST PAID", "amount": 16.49}}
+                    ]
+                
+                    ### TEXT TO ANALYZE:
+                    {md_text}
+                    """,
                     "stream": False,
-                    "format": "json"
+                    "format": "json",
+                    "options": {
+                        "temperature": 0,      # 關閉隨機性，確保結果穩定
+                        "num_predict": 1000,   # 確保有足夠長度生完個 JSON
+                        "top_k": 20,           # 減少發散
+                        "top_p": 0.9
+                    }
                 }
                 
                 try:
