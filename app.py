@@ -1,175 +1,357 @@
-import streamlit as st
-import os
-import requests
 import json
-import pandas as pd
+import os
 import re
+import shutil
+import traceback
 from glob import glob
-from docling.document_converter import DocumentConverter
-import tkinter as tk
-from tkinter import filedialog
 
-# --- 初始化頁面設定 ---
-st.set_page_config(page_title="銀行利息自動提取器", page_icon="💰", layout="wide")
+import pandas as pd
+import platformdirs
+import requests
+import streamlit as st
 
-# --- Helper Functions ---
-def get_ollama_models(base_url):
-    """從 Ollama API 攞現有嘅模型清單"""
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception:
+    tk = None
+    filedialog = None
+
+try:
+    from pdf2image import convert_from_path
+except Exception:
+    convert_from_path = None
+try:
+    import pypdfium2 as pdfium
+except Exception:
+    pdfium = None
+
+SURYA_IMPORT_ERROR = None
+try:
+    from surya.detection import DetectionPredictor
+    from surya.foundation import FoundationPredictor
+    from surya.recognition import RecognitionPredictor
+except Exception as e:
+    SURYA_IMPORT_ERROR = str(e)
+    FoundationPredictor = None
+    DetectionPredictor = None
+    RecognitionPredictor = None
+
+st.set_page_config(page_title="Bank Statement Interest Checker", page_icon="PDF", layout="wide")
+
+KEYWORDS = ["Interest", "INT", "CR", "Interest Credit", "Interest Paid", "Interest Income", "li xi"]
+
+
+@st.cache_resource(show_spinner="Loading Surya OCR models...")
+def load_surya_models():
+    if SURYA_IMPORT_ERROR:
+        st.error(f"Surya OCR import failed: {SURYA_IMPORT_ERROR}")
+        if "torchvision::nms" in SURYA_IMPORT_ERROR or "PreTrainedModel" in SURYA_IMPORT_ERROR:
+            st.code(
+                "pip uninstall -y torchvision\n"
+                "pip install --upgrade torch transformers surya-ocr",
+                language="bash",
+            )
+            st.info(
+                "Detected a torch/torchvision mismatch. "
+                "torchvision is optional for this app and can be removed."
+            )
+        else:
+            st.info("Install Surya with: pip install surya-ocr")
+        return None, None, None
+
     try:
-        response = requests.get(f"{base_url}/api/tags")
-        if response.status_code == 200:
-            models = [m['name'] for m in response.json()['models']]
-            return models
-        return ["llama3:8b", "llama3.2"]
-    except:
-        return ["連線失敗，請檢查 URL"]
+        foundation = FoundationPredictor()
+        det_predictor = DetectionPredictor()
+        rec_predictor = RecognitionPredictor(foundation)
+        return foundation, det_predictor, rec_predictor
+    except Exception as e:
+        err_text = str(e)
+        if isinstance(e, OSError) and getattr(e, "errno", None) == 22:
+            cache_root = platformdirs.user_cache_dir("datalab")
+            models_cache = os.path.join(cache_root, "datalab", "Cache", "models")
+            st.warning(
+                f"Surya model cache may be corrupted on Windows (Errno 22). "
+                f"Clearing cache and retrying once: {models_cache}"
+            )
+            try:
+                if os.path.exists(models_cache):
+                    shutil.rmtree(models_cache, ignore_errors=True)
+
+                foundation = FoundationPredictor()
+                det_predictor = DetectionPredictor()
+                rec_predictor = RecognitionPredictor(foundation)
+                st.success("Surya OCR models initialized after cache reset.")
+                return foundation, det_predictor, rec_predictor
+            except Exception as retry_err:
+                st.error(f"Retry after cache reset failed: {retry_err}")
+                st.code(traceback.format_exc(), language="text")
+                return None, None, None
+
+        st.error(f"Failed to initialize Surya OCR models: {err_text}")
+        st.code(traceback.format_exc(), language="text")
+        return None, None, None
+
+
+def get_ollama_models(base_url: str):
+    try:
+        response = requests.get(f"{base_url}/api/tags", timeout=10)
+        response.raise_for_status()
+        models = [m["name"] for m in response.json().get("models", [])]
+        return models or ["llama3:8b", "llama3.2"]
+    except Exception:
+        return ["Could not fetch models - check Ollama URL"]
+
 
 def select_folder():
-    """彈出視窗俾用家揀 Folder (適用於 Local 執行)"""
+    if tk is None or filedialog is None:
+        st.error("tkinter is not available in this environment.")
+        return ""
+
     root = tk.Tk()
     root.withdraw()
-    root.attributes('-topmost', True)
+    root.attributes("-topmost", True)
     folder_selected = filedialog.askdirectory(master=root)
     root.destroy()
     return folder_selected
 
-# --- UI 介面 ---
-st.title("💰 銀行月結單利息自動提取器")
-st.markdown("透過 **Docling** 解析 PDF 並使用 **Local LLM** 進行數據匯總。")
+
+def ocr_pdf_to_lines(pdf_path, models, poppler_path=None):
+    foundation, det_predictor, rec_predictor = models
+    if not all([foundation, det_predictor, rec_predictor]):
+        raise RuntimeError("Surya OCR models are not ready.")
+
+    pages = []
+    if convert_from_path is not None:
+        try:
+            pages = convert_from_path(pdf_path, dpi=200, poppler_path=poppler_path or None)
+        except Exception as e:
+            # Fall back to pypdfium2 if Poppler is not installed or not in PATH.
+            if pdfium is None:
+                st.error(
+                    "Failed to convert PDF pages. Poppler was not found and pypdfium2 is unavailable. "
+                    f"Details: {e}"
+                )
+                return []
+    if not pages:
+        if pdfium is None:
+            st.error(
+                "PDF conversion failed. Install Poppler (pdftoppm) or install pypdfium2."
+            )
+            return []
+        try:
+            doc = pdfium.PdfDocument(pdf_path)
+            scale = 200 / 72
+            for i in range(len(doc)):
+                page = doc[i]
+                pil_img = page.render(scale=scale).to_pil()
+                pages.append(pil_img)
+                page.close()
+            doc.close()
+        except Exception as e:
+            st.error(
+                "Failed to convert PDF pages with both pdf2image and pypdfium2. "
+                f"Details: {e}"
+            )
+            return []
+
+    if not pages:
+        return []
+
+    predictions = rec_predictor(
+        pages,
+        det_predictor=det_predictor,
+        sort_lines=False,
+        math_mode=True,
+    )
+
+    lines = []
+    for page_result in predictions:
+        for line_obj in page_result.text_lines:
+            text = getattr(line_obj, "text", "")
+            if text:
+                lines.append(text)
+    return lines
+
+
+def filter_interest_context(lines):
+    if not lines:
+        return ""
+
+    matched_indices = set()
+    for i, line in enumerate(lines):
+        lower_line = line.lower()
+        for kw in KEYWORDS:
+            if kw.lower() in lower_line:
+                for j in range(max(0, i - 2), min(len(lines), i + 3)):
+                    matched_indices.add(j)
+                break
+
+    if not matched_indices:
+        return ""
+
+    ordered_indices = sorted(matched_indices)
+    filtered_lines = [lines[i] for i in ordered_indices]
+    return "\n".join(filtered_lines)
+
+
+st.title("Bank Statement Interest Checker")
+st.markdown("Use pdf2image + Surya OCR to read PDFs and Ollama to extract interest credits.")
 
 with st.sidebar:
-    st.header("⚙️ 設定")
+    st.header("Settings")
     ollama_ip = st.text_input("Ollama Server URL", value="http://127.0.0.1:11434")
-    
-    # 動態獲取模型清單
+
     model_list = get_ollama_models(ollama_ip)
-    selected_model = st.selectbox("選擇 LLM 模型", model_list)
-    
+    selected_model = st.selectbox("LLM Model", model_list)
+
     st.divider()
-    if st.button("📁 選擇月結單資料夾"):
+    poppler_path = st.text_input(
+        "Poppler Path",
+        help=r"Path to Poppler 'bin' directory, e.g., C:\path\to\poppler-xx\bin",
+    )
+    st.session_state["poppler_path"] = poppler_path
+
+    if st.button("Select PDF Folder"):
         folder_path = select_folder()
-        st.session_state['folder_path'] = folder_path
+        if folder_path:
+            st.session_state["folder_path"] = folder_path
 
-# 顯示已選路徑
-current_folder = st.session_state.get('folder_path', "未選擇資料夾")
-st.info(f"📍 當前處理路徑: `{current_folder}`")
+current_folder = st.session_state.get("folder_path", "No folder selected")
+st.info(f"Current folder: `{current_folder}`")
 
-# --- 核心邏輯 ---
-if st.button("🚀 開始掃描並轉換", type="primary"):
-    if not os.path.exists(current_folder) or current_folder == "未選擇資料夾":
-        st.error("請先選擇一個有效的資料夾！")
+if st.button("Run Extraction", type="primary"):
+    if not os.path.exists(current_folder) or current_folder == "No folder selected":
+        st.error("Please select a valid folder first.")
     else:
         pdf_files = glob(os.path.join(current_folder, "*.pdf"))
         if not pdf_files:
-            st.warning("資料夾內冇 PDF 檔案。")
+            st.warning("No PDF files found in selected folder.")
         else:
             progress_bar = st.progress(0)
             status_text = st.empty()
             all_results = []
-            
-            converter = DocumentConverter()
-            
-            for idx, pdf in enumerate(pdf_files):
-                filename = os.path.basename(pdf)
-                status_text.text(f"正在處理 ({idx+1}/{len(pdf_files)}): {filename}")
-                
-                # 1. Docling 轉換
-                result = converter.convert(pdf)
-                md_text = result.document.export_to_markdown()
-                
-                # 2. Call Ollama
-                payload = {
-                    "model": selected_model,
-                    "prompt": f"""
-                    You are a professional bank auditor. Extract all "Interest Credit" entries from this statement.
-                    
-                    ### RULES:
-                    1. Look for keywords: "Interest", "INT", "CR", "利息", "存入利息".
-                    2. Identify the EXACT amount. Do NOT confuse "Balance" (large numbers) with "Interest" (small numbers).
-                    3. If the date format is inconsistent, normalize it to YYYY-MM-DD.
-                    4. RETURN ONLY A JSON ARRAY. No chat, no preamble.
-                    
-                    ### FORMAT EXAMPLE:
-                    [
-                      {{"date": "2024-04-30", "description": "INTEREST PAID", "amount": 16.49}}
-                    ]
-                
-                    ### TEXT TO ANALYZE:
-                    {md_text}
-                    """,
-                    "stream": False,
-                    "format": "json",
-                    "options": {
-                        "temperature": 0,      # 關閉隨機性，確保結果穩定
-                        "num_predict": 1000,   # 確保有足夠長度生完個 JSON
-                        "top_k": 20,           # 減少發散
-                        "top_p": 0.9
-                    }
-                }
-                
-                try:
-                    res = requests.post(f"{ollama_ip}/api/generate", json=payload)
-                    response_data = res.json().get('response', '[]').strip()
-                    
-                    # --- 強效清理步驟 ---
-                    # 1. 移除 JSON 以外嘅文字 (有時 LLM 會加 "Here is your JSON:")
-                    json_match = re.search(r'\[.*\]', response_data, re.DOTALL)
-                    if json_match:
-                        clean_json = json_match.group(0)
-                    else:
-                        clean_json = response_data
 
-                    # 2. 處理常見語法錯誤：將單引號轉雙引號，移除尾隨逗號
-                    clean_json = clean_json.replace("'", '"')
-                    clean_json = re.sub(r',\s*\]', ']', clean_json) # 移除 [...,] 嘅逗號
-                    
-                    # 嘗試解析
-                    items = json.loads(clean_json)
-                    
-                    # --- 防錯檢查：確保 items 係一個 list ---
-                    if isinstance(items, list):
-                        for item in items:
-                            if isinstance(item, dict): # 確保入面係字典
-                                item['source'] = filename  # 呢度就係原本出錯嘅地方
-                                all_results.append(item)
-                    elif isinstance(items, dict): # 有時模型只會回傳單一物件
-                        items['source'] = filename
-                        all_results.append(items)
-                        
-                except Exception as e:
-                    st.error(f"分析 {filename} 時出錯: {e}")
-                    # 打印出嚟睇吓 LLM 到底俾咗咩你，方便除錯
-                    st.code(response_data, language="json")            
-                progress_bar.progress((idx + 1) / len(pdf_files))
+            models = load_surya_models()
+            if not all(models):
+                st.error("OCR model load failed. Please fix dependencies and retry.")
+            else:
+                for idx, pdf in enumerate(pdf_files):
+                    filename = os.path.basename(pdf)
+                    status_text.text(f"Processing ({idx + 1}/{len(pdf_files)}): {filename}")
 
-            # 3. 顯示結果
+                    try:
+                        lines = ocr_pdf_to_lines(
+                            pdf,
+                            models,
+                            poppler_path=st.session_state.get("poppler_path"),
+                        )
+
+                        filtered_context = filter_interest_context(lines)
+
+                        if not filtered_context.strip():
+                            progress_bar.progress((idx + 1) / len(pdf_files))
+                            continue
+
+                        prompt = f"""
+You are a professional bank auditor. Extract all "Interest Credit" entries from this statement.
+
+The text has already been pre-filtered to lines that likely contain interest-related information.
+
+### TASK:
+From the text below, extract every record where bank interest is credited to the account.
+
+### FIELDS:
+- date: Transaction date in YYYY-MM-DD format (normalize if needed)
+- description: Short description of the transaction
+- amount: Interest amount as a number (do NOT use balance amounts)
+
+### RULES:
+1. Only include rows that correspond to interest credit / interest income.
+2. Ignore running balances, totals, and non-interest fees.
+3. If a row has multiple numbers, choose the one that is clearly the interest amount.
+4. If you are unsure, skip that row instead of guessing.
+
+### OUTPUT FORMAT (STRICT):
+Return ONLY a JSON array. No explanation, no text around it.
+
+Example:
+[
+  {{"date": "2024-04-30", "description": "INTEREST PAID", "amount": 16.49}}
+]
+
+### FILTERED CONTEXT TO ANALYZE:
+{filtered_context}
+""".strip()
+
+                        payload = {
+                            "model": selected_model,
+                            "prompt": prompt,
+                            "stream": False,
+                            "format": "json",
+                            "options": {
+                                "temperature": 0,
+                                "num_predict": 1000,
+                                "top_k": 20,
+                                "top_p": 0.9,
+                            },
+                        }
+
+                        res = requests.post(f"{ollama_ip}/api/generate", json=payload, timeout=120)
+                        res.raise_for_status()
+                        response_data = res.json().get("response", "[]").strip()
+
+                        json_match = re.search(r"\[.*\]", response_data, re.DOTALL)
+                        clean_json = json_match.group(0) if json_match else response_data
+                        items = json.loads(clean_json or "[]")
+
+                        if isinstance(items, list):
+                            for item in items:
+                                if isinstance(item, dict):
+                                    item["source"] = filename
+                                    all_results.append(item)
+                        elif isinstance(items, dict):
+                            items["source"] = filename
+                            all_results.append(items)
+
+                    except Exception as e:
+                        st.error(f"Error in {filename}: {e}")
+
+                    progress_bar.progress((idx + 1) / len(pdf_files))
+
             if all_results:
                 df = pd.DataFrame(all_results)
-                
-                # --- 新增：欄位清洗機制 ---
-                # 預防模型俾錯名 (例如 '金額' -> 'amount')
+
                 rename_map = {
-                    '金額': 'amount', 
-                    'Value': 'amount', 
-                    'price': 'amount',
-                    '日期': 'date',
-                    'description': 'description',
-                    '項目': 'description'
+                    "amount_value": "amount",
+                    "Value": "amount",
+                    "price": "amount",
+                    "date_value": "date",
+                    "desc": "description",
                 }
                 df.rename(columns=rename_map, inplace=True)
 
-                # 檢查 'amount' 欄位是否存在
-                if 'amount' in df.columns:
-                    # 去除數字入面的千分位逗號 (例如 1,234.50 -> 1234.50)
-                    df['amount'] = df['amount'].astype(str).str.replace(',', '').str.replace('$', '')
-                    df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+                if "amount" in df.columns:
+                    df["amount"] = (
+                        df["amount"].astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False)
+                    )
+                    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
                 else:
-                    # 如果真係冇 amount 欄位，就補一個全 0 嘅俾佢，防止報錯
-                    df['amount'] = 0.0
+                    df["amount"] = 0.0
 
-                st.success("✅ 處理完成！")
-                st.subheader("📊 利息收入匯總表")
+                st.success("Extraction completed.")
+                st.subheader("Interest Records")
                 st.dataframe(df, use_container_width=True)
-                
-                total = df['amount'].sum()
-                st.metric("全年總利息收入", f"${total:,.2f}")
+
+                total = df["amount"].sum()
+                st.metric("Total Interest", f"${total:,.2f}")
+
+                csv_data = df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    label="Download CSV",
+                    data=csv_data,
+                    file_name="interest_summary.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.warning("No interest records found.")
