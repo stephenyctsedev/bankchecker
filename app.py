@@ -522,6 +522,28 @@ def truncate_text_to_tokens(text, token_limit=1000):
     return "\n".join(out), truncated
 
 
+def call_ollama_json_with_retry(ollama_ip, payload, timeout_sec=180, retries=2):
+    last_err = None
+    for attempt in range(int(retries) + 1):
+        try:
+            res = requests.post(f"{ollama_ip}/api/generate", json=payload, timeout=int(timeout_sec))
+            res.raise_for_status()
+            return parse_json_array(res.json().get("response", "[]").strip())
+        except requests.exceptions.ReadTimeout as e:
+            last_err = e
+            if attempt < int(retries):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(
+                f"Ollama read timeout after {timeout_sec}s (retries={retries}). "
+                "Increase timeout, reduce max pages, or reduce context token limit."
+            ) from e
+        except Exception as e:
+            last_err = e
+            break
+    raise RuntimeError(f"Ollama call failed: {last_err}")
+
+
 st.title("Bank Statement Interest Checker")
 st.markdown("Use pdf2image + Surya OCR to read PDFs and Ollama to extract interest credits.")
 
@@ -595,6 +617,29 @@ with st.sidebar:
         max_value=95,
         value=70,
         step=5,
+    )
+    st.divider()
+    st.subheader("Text LLM Settings")
+    text_llm_timeout = st.number_input(
+        "Text LLM timeout (seconds)",
+        min_value=60,
+        max_value=1200,
+        value=360,
+        step=30,
+    )
+    text_llm_retries = st.number_input(
+        "Text LLM retries",
+        min_value=0,
+        max_value=5,
+        value=2,
+        step=1,
+    )
+    text_token_limit = st.number_input(
+        "Combined context token limit",
+        min_value=200,
+        max_value=3000,
+        value=1000,
+        step=100,
     )
 
 current_folder = st.session_state.get("folder_path", "No folder selected")
@@ -691,9 +736,11 @@ if st.button("Run Extraction", type="primary"):
                 unload_surya_models(models)
                 if all_snippets:
                     combined_context = "\n\n".join(all_snippets)
-                    combined_context, was_truncated = truncate_text_to_tokens(combined_context, token_limit=1000)
+                    combined_context, was_truncated = truncate_text_to_tokens(
+                        combined_context, token_limit=int(text_token_limit)
+                    )
                     if was_truncated:
-                        st.info("Combined context exceeded 1000 tokens and was truncated.")
+                        st.info(f"Combined context exceeded {int(text_token_limit)} tokens and was truncated.")
                     prompt = f"""
 You are a professional bank auditor. Extract all interest-credit transactions from the combined context.
 
@@ -722,10 +769,12 @@ Context:
                         },
                     }
                     try:
-                        res = requests.post(f"{ollama_ip}/api/generate", json=payload, timeout=180)
-                        res.raise_for_status()
-                        response_data = res.json().get("response", "[]").strip()
-                        items = parse_json_array(response_data)
+                        items = call_ollama_json_with_retry(
+                            ollama_ip=ollama_ip,
+                            payload=payload,
+                            timeout_sec=int(text_llm_timeout),
+                            retries=int(text_llm_retries),
+                        )
                         for item in items:
                             if isinstance(item, dict):
                                 all_results.append(item)
