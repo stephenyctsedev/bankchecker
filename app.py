@@ -116,7 +116,12 @@ def select_folder():
     return folder_selected
 
 
-def ocr_pdf_to_lines(pdf_path, models, poppler_path=None):
+def _pdf_signature(pdf_path: str) -> str:
+    stat = os.stat(pdf_path)
+    return f"{stat.st_size}-{stat.st_mtime_ns}"
+
+
+def ocr_pdf_to_lines(pdf_path, models, poppler_path=None, ocr_dpi=150, max_pages=0, math_mode=False):
     foundation, det_predictor, rec_predictor = models
     if not all([foundation, det_predictor, rec_predictor]):
         raise RuntimeError("Surya OCR models are not ready.")
@@ -124,7 +129,7 @@ def ocr_pdf_to_lines(pdf_path, models, poppler_path=None):
     pages = []
     if convert_from_path is not None:
         try:
-            pages = convert_from_path(pdf_path, dpi=200, poppler_path=poppler_path or None)
+            pages = convert_from_path(pdf_path, dpi=ocr_dpi, poppler_path=poppler_path or None)
         except Exception as e:
             # Fall back to pypdfium2 if Poppler is not installed or not in PATH.
             if pdfium is None:
@@ -141,8 +146,11 @@ def ocr_pdf_to_lines(pdf_path, models, poppler_path=None):
             return []
         try:
             doc = pdfium.PdfDocument(pdf_path)
-            scale = 200 / 72
-            for i in range(len(doc)):
+            scale = ocr_dpi / 72
+            page_count = len(doc)
+            if max_pages and max_pages > 0:
+                page_count = min(page_count, int(max_pages))
+            for i in range(page_count):
                 page = doc[i]
                 pil_img = page.render(scale=scale).to_pil()
                 pages.append(pil_img)
@@ -157,12 +165,14 @@ def ocr_pdf_to_lines(pdf_path, models, poppler_path=None):
 
     if not pages:
         return []
+    if max_pages and max_pages > 0:
+        pages = pages[: int(max_pages)]
 
     predictions = rec_predictor(
         pages,
         det_predictor=det_predictor,
         sort_lines=False,
-        math_mode=True,
+        math_mode=math_mode,
     )
 
     lines = []
@@ -172,6 +182,22 @@ def ocr_pdf_to_lines(pdf_path, models, poppler_path=None):
             if text:
                 lines.append(text)
     return lines
+
+
+@st.cache_data(show_spinner=False)
+def ocr_pdf_to_lines_cached(pdf_path, pdf_signature, poppler_path=None, ocr_dpi=150, max_pages=0, math_mode=False):
+    _ = pdf_signature
+    models = load_surya_models()
+    if not all(models):
+        return []
+    return ocr_pdf_to_lines(
+        pdf_path,
+        models,
+        poppler_path=poppler_path,
+        ocr_dpi=ocr_dpi,
+        max_pages=max_pages,
+        math_mode=math_mode,
+    )
 
 
 def filter_interest_context(lines):
@@ -211,6 +237,18 @@ with st.sidebar:
         help=r"Path to Poppler 'bin' directory, e.g., C:\path\to\poppler-xx\bin",
     )
     st.session_state["poppler_path"] = poppler_path
+    st.divider()
+    st.subheader("OCR Performance")
+    ocr_dpi = st.slider("OCR DPI", min_value=100, max_value=250, value=150, step=10)
+    max_pages = st.number_input(
+        "Max pages per PDF (0 = all pages)",
+        min_value=0,
+        max_value=500,
+        value=5,
+        step=1,
+    )
+    math_mode = st.checkbox("Enable math mode (slower)", value=False)
+    use_ocr_cache = st.checkbox("Cache OCR result per PDF", value=True)
 
     if st.button("Select PDF Folder"):
         folder_path = select_folder()
@@ -241,11 +279,24 @@ if st.button("Run Extraction", type="primary"):
                     status_text.text(f"Processing ({idx + 1}/{len(pdf_files)}): {filename}")
 
                     try:
-                        lines = ocr_pdf_to_lines(
-                            pdf,
-                            models,
-                            poppler_path=st.session_state.get("poppler_path"),
-                        )
+                        if use_ocr_cache:
+                            lines = ocr_pdf_to_lines_cached(
+                                pdf,
+                                _pdf_signature(pdf),
+                                poppler_path=st.session_state.get("poppler_path"),
+                                ocr_dpi=ocr_dpi,
+                                max_pages=max_pages,
+                                math_mode=math_mode,
+                            )
+                        else:
+                            lines = ocr_pdf_to_lines(
+                                pdf,
+                                models,
+                                poppler_path=st.session_state.get("poppler_path"),
+                                ocr_dpi=ocr_dpi,
+                                max_pages=max_pages,
+                                math_mode=math_mode,
+                            )
 
                         filtered_context = filter_interest_context(lines)
 
