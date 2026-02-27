@@ -1,10 +1,11 @@
-FROM python:3.10-slim
+FROM python:3.10-slim-bookworm
 
 # System packages: poppler for pdf2image, libGL for PaddleOCR/OpenCV
+# Note: libgl1-mesa-glx was replaced by libgl1 in Debian bookworm+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils \
         libglib2.0-0 \
-        libgl1-mesa-glx \
+        libgl1 \
         libsm6 \
         libxext6 \
         libxrender1 \
