@@ -1,175 +1,516 @@
-import streamlit as st
 import os
-import requests
-import json
-import pandas as pd
 import re
-from glob import glob
-from docling.document_converter import DocumentConverter
-import tkinter as tk
-from tkinter import filedialog
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- 初始化頁面設定 ---
-st.set_page_config(page_title="銀行利息自動提取器", page_icon="💰", layout="wide")
+import pandas as pd
+import streamlit as st
 
-# --- Helper Functions ---
-def get_ollama_models(base_url):
-    """從 Ollama API 攞現有嘅模型清單"""
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception:
+    tk = None
+    filedialog = None
+
+try:
+    from pdf2image import convert_from_path
+except Exception:
+    convert_from_path = None
+try:
+    import pypdfium2 as pdfium
+except Exception:
+    pdfium = None
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+try:
+    from paddleocr import PaddleOCR as _PaddleOCR
+except Exception:
+    _PaddleOCR = None
+try:
+    import torch
+except Exception:
+    torch = None
+
+st.set_page_config(page_title="Bank Statement Interest Checker", page_icon="PDF", layout="wide")
+
+# Month abbreviations used by Bangkok Bank date format (e.g. 01MAR24)
+_MONTH_MAP = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+# Match any interest-related keyword (English or Chinese)
+_INTEREST_RE = re.compile(r"INTEREST|利息|INT\b", re.IGNORECASE)
+
+# Match decimal numbers (currency values like 6.76 or 9,728.25)
+# Using only decimal numbers avoids false positives from integer date parts (01, 31, 24)
+_DECIMAL_RE = re.compile(r"[\d,]+\.\d+")
+
+
+# ---------------------------------------------------------------------------
+# Compute detection
+# ---------------------------------------------------------------------------
+
+def detect_compute():
+    if torch is None:
+        return "cpu", 0
     try:
-        response = requests.get(f"{base_url}/api/tags")
-        if response.status_code == 200:
-            models = [m['name'] for m in response.json()['models']]
-            return models
-        return ["llama3:8b", "llama3.2"]
-    except:
-        return ["連線失敗，請檢查 URL"]
+        if torch.cuda.is_available():
+            return "cuda", 1
+    except Exception:
+        pass
+    return "cpu", 0
 
-def select_folder():
-    """彈出視窗俾用家揀 Folder (適用於 Local 執行)"""
+
+# ---------------------------------------------------------------------------
+# File picker
+# ---------------------------------------------------------------------------
+
+def select_pdf_files():
+    if tk is None or filedialog is None:
+        st.error("tkinter is not available in this environment.")
+        return []
     root = tk.Tk()
     root.withdraw()
-    root.attributes('-topmost', True)
-    folder_selected = filedialog.askdirectory(master=root)
+    root.attributes("-topmost", True)
+    files_selected = filedialog.askopenfilenames(
+        master=root,
+        title="Select PDF files",
+        filetypes=[("PDF files", "*.pdf")],
+    )
     root.destroy()
-    return folder_selected
+    return list(files_selected)
 
-# --- UI 介面 ---
-st.title("💰 銀行月結單利息自動提取器")
-st.markdown("透過 **Docling** 解析 PDF 並使用 **Local LLM** 進行數據匯總。")
+
+# ---------------------------------------------------------------------------
+# PDF helpers
+# ---------------------------------------------------------------------------
+
+def _pdf_signature(pdf_path: str) -> str:
+    stat = os.stat(pdf_path)
+    return f"{stat.st_size}-{stat.st_mtime_ns}"
+
+
+def _is_substantial_text(text: str) -> bool:
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    return len(clean) > 100
+
+
+def _is_gibberish_text(text: str) -> bool:
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if not clean:
+        return True
+    alnum_ratio = sum(c.isalnum() for c in clean) / max(1, len(clean))
+    if alnum_ratio < 0.40:
+        return True
+    words = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", clean)
+    return len(words) < 6
+
+
+def _render_single_page_image(pdf_path, page_index, dpi=150, poppler_path=None):
+    page_no = int(page_index) + 1
+    if convert_from_path is not None:
+        try:
+            pages = convert_from_path(
+                pdf_path,
+                dpi=dpi,
+                poppler_path=poppler_path or None,
+                first_page=page_no,
+                last_page=page_no,
+            )
+            if pages:
+                return pages[0]
+        except Exception:
+            pass
+    if pdfium is None:
+        raise RuntimeError("No PDF renderer available for OCR fallback.")
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        page = doc[int(page_index)]
+        img = page.render(scale=dpi / 72).to_pil()
+        page.close()
+        return img
+    finally:
+        doc.close()
+
+
+# ---------------------------------------------------------------------------
+# PaddleOCR
+# ---------------------------------------------------------------------------
+
+def _paddle_ocr_image_to_lines(image, paddle_ocr):
+    """Run PaddleOCR on a PIL image; returns list of text lines or None on failure."""
+    if paddle_ocr is None:
+        return None
+    try:
+        import numpy as np
+        result = paddle_ocr.ocr(np.array(image), cls=True)
+        if not result or not result[0]:
+            return []
+        lines = []
+        for line in result[0]:
+            if line and len(line) >= 2:
+                text = line[1][0] if isinstance(line[1], (list, tuple)) else ""
+                if text:
+                    lines.append(str(text))
+        return lines
+    except Exception as e:
+        print(f"[OCR] PaddleOCR inference error: {e}")
+        return None
+
+
+def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages=0, max_workers=4, force_ocr=False, paddle_ocr=None):
+    if fitz is not None:
+        with fitz.open(pdf_path) as doc:
+            page_count = doc.page_count
+    elif pdfium is not None:
+        doc = pdfium.PdfDocument(pdf_path)
+        page_count = len(doc)
+        doc.close()
+    else:
+        page_count = 0
+
+    if max_pages and max_pages > 0:
+        page_count = min(page_count, int(max_pages))
+    if page_count <= 0:
+        return []
+
+    def _process_text_page(page_idx):
+        if force_ocr:
+            print(f"[OCR] Page {page_idx + 1}: force_ocr=True → queued for OCR")
+            return page_idx, [], True
+        page_text = ""
+        if pdfplumber is not None:
+            try:
+                with pdfplumber.open(pdf_path) as plumb_doc:
+                    page_text = plumb_doc.pages[page_idx].extract_text() or ""
+            except Exception:
+                page_text = ""
+        if not page_text and fitz is not None:
+            with fitz.open(pdf_path) as fdoc:
+                page_text = fdoc.load_page(page_idx).get_text("text") or ""
+        if _is_substantial_text(page_text) and not _is_gibberish_text(page_text):
+            engine = "pdfplumber" if pdfplumber is not None else "PyMuPDF"
+            print(f"[OCR] Page {page_idx + 1}: text extracted via {engine} ({len(page_text)} chars)")
+            extracted_lines = [ln.strip() for ln in page_text.splitlines() if ln and ln.strip()]
+            return page_idx, extracted_lines, False
+        print(f"[OCR] Page {page_idx + 1}: text extraction insufficient → queued for OCR")
+        return page_idx, [], True
+
+    results = {}
+    ocr_needed_pages = []
+    workers = max(1, int(max_workers))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_process_text_page, i) for i in range(page_count)]
+        for fut in as_completed(futures):
+            page_idx, page_lines, needs_ocr = fut.result()
+            results[page_idx] = page_lines
+            if needs_ocr:
+                ocr_needed_pages.append(page_idx)
+
+    for page_idx in sorted(ocr_needed_pages):
+        img = _render_single_page_image(pdf_path, page_idx, dpi=ocr_dpi, poppler_path=poppler_path)
+        paddle_lines = _paddle_ocr_image_to_lines(img, paddle_ocr)
+        if paddle_lines is not None:
+            joined = "\n".join(paddle_lines)
+            if _is_substantial_text(joined) and not _is_gibberish_text(joined):
+                print(f"[OCR] Page {page_idx + 1}: used PaddleOCR ({len(paddle_lines)} lines)")
+                results[page_idx] = paddle_lines
+                continue
+            else:
+                print(f"[OCR] Page {page_idx + 1}: PaddleOCR output insufficient, page skipped")
+        else:
+            print(f"[OCR] Page {page_idx + 1}: PaddleOCR unavailable/failed, page skipped")
+        results[page_idx] = []
+
+    lines = []
+    for i in range(page_count):
+        lines.extend(results.get(i, []))
+    return lines
+
+
+@st.cache_resource(show_spinner=False)
+def load_paddle_ocr(use_gpu=False):
+    if _PaddleOCR is None:
+        return None
+    gpu_variants = (
+        [{"device": "gpu"}, {"use_gpu": True}] if use_gpu else []
+    ) + [{}]
+    base_options = [
+        {"use_textline_orientation": True, "lang": "en"},  # PaddleOCR 3.x
+        {"use_angle_cls": True, "lang": "en"},             # PaddleOCR 2.x
+        {"lang": "en"},                                    # minimal fallback
+    ]
+    last_err = None
+    for base in base_options:
+        for extra in gpu_variants:
+            try:
+                ocr = _PaddleOCR(**base, **extra)
+                print(f"[OCR] PaddleOCR loaded — base={base} gpu={extra or 'auto'}")
+                return ocr
+            except TypeError:
+                continue
+            except Exception as e:
+                last_err = e
+                break
+    print(f"[OCR] PaddleOCR failed to load: {last_err}")
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def ocr_pdf_to_lines_cached(
+    pdf_path,
+    pdf_signature,
+    poppler_path=None,
+    ocr_dpi=150,
+    max_pages=0,
+    max_workers=4,
+    force_ocr=False,
+):
+    _ = pdf_signature
+    device, _ = detect_compute()
+    paddle_ocr = load_paddle_ocr(use_gpu=(device == "cuda"))
+    return extract_pdf_lines_hybrid(
+        pdf_path,
+        poppler_path=poppler_path,
+        ocr_dpi=ocr_dpi,
+        max_pages=max_pages,
+        max_workers=max_workers,
+        force_ocr=force_ocr,
+        paddle_ocr=paddle_ocr,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Interest extraction (no LLM — pure regex)
+# ---------------------------------------------------------------------------
+
+def _parse_date(token: str):
+    """
+    Try to parse a single token as a date.
+    Supports:
+      - Bangkok Bank format: DDMMMYY  e.g. 01MAR24
+      - Citibank format:     MM/DD/YY or MM/DD/YYYY  e.g. 01/31/24
+    Returns 'YYYY-MM-DD' string or None.
+    """
+    # Bangkok Bank: 01MAR24
+    m = re.fullmatch(r"(\d{2})([A-Z]{3})(\d{2})", token, re.IGNORECASE)
+    if m:
+        day, mon, yr = m.groups()
+        month = _MONTH_MAP.get(mon.upper())
+        if month:
+            return f"20{yr}-{month:02d}-{int(day):02d}"
+    # Citibank: 01/31/24 or 01/31/2024
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", token)
+    if m:
+        mm, dd, yr = m.groups()
+        year = int(yr) if len(yr) == 4 else 2000 + int(yr)
+        return f"{year}-{int(mm):02d}-{int(dd):02d}"
+    return None
+
+
+def _extract_description(line: str) -> str:
+    """
+    Strip date prefixes and trailing amount/balance numbers from a line
+    to leave the core description text.
+    """
+    s = line.strip()
+    # Remove up to two leading date tokens (Citibank repeats the date twice)
+    for _ in range(2):
+        s = re.sub(r"^\d{2}[A-Z]{3}\d{2}\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"^\d{1,2}/\d{1,2}/\d{2,4}\s*", "", s)
+    # Remove leading 4-digit time/reference code (Bangkok Bank "0000")
+    s = re.sub(r"^\d{4}\s+", "", s)
+    # Remove trailing two decimal numbers (amount + running balance)
+    s = re.sub(r"\s+[\d,]+\.\d+\s+[\d,]+\.\d+\s*$", "", s)
+    # Remove one trailing decimal number if still present
+    s = re.sub(r"\s+[\d,]+\.\d+\s*$", "", s)
+    return s.strip()
+
+
+def extract_interest_from_lines(lines: list, filename: str) -> list:
+    """
+    Scan text lines for interest transactions using keyword matching.
+    No LLM required.
+
+    Line formats handled:
+      Bangkok Bank: 01MAR24 0000 INTEREST 利息收入 6.76 9,728.25
+      Citibank:     01/31/24 01/31/24 存入利息 (JAN) 16.62 19,678.26
+
+    Strategy:
+      - Only decimal numbers (e.g. 6.76, 9,728.25) are collected — this avoids
+        false positives from integer date parts like "01", "31", "24".
+      - The second-to-last decimal number is the transaction amount.
+      - The last decimal number is the running balance (ignored).
+      - If only one decimal number is on the line it is taken as the amount.
+    """
+    results = []
+    for line in lines:
+        if not _INTEREST_RE.search(line):
+            continue
+
+        # Collect all decimal (currency-style) numbers on the line
+        raw_nums = _DECIMAL_RE.findall(line)
+        nums = []
+        for n in raw_nums:
+            try:
+                nums.append(float(n.replace(",", "")))
+            except ValueError:
+                pass
+        if not nums:
+            continue
+
+        # Second-to-last = amount, last = running balance
+        amount = nums[-2] if len(nums) >= 2 else nums[-1]
+
+        # Find the first recognisable date token; skip lines with no date
+        date_str = ""
+        for token in line.split():
+            d = _parse_date(token)
+            if d:
+                date_str = d
+                break
+        if not date_str:
+            print(f"[EXTRACT] {filename} | skipped (no date): {line!r}")
+            continue
+
+        description = _extract_description(line)
+        print(f"[EXTRACT] {filename} | date={date_str} | amount={amount} | desc={description!r}")
+        results.append({
+            "source": filename,
+            "date": date_str,
+            "description": description,
+            "amount": amount,
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+st.title("Bank Statement Interest Checker")
+st.markdown("Extracts interest transactions from bank PDFs using keyword matching — no LLM required.")
 
 with st.sidebar:
-    st.header("⚙️ 設定")
-    ollama_ip = st.text_input("Ollama Server URL", value="http://127.0.0.1:11434")
-    
-    # 動態獲取模型清單
-    model_list = get_ollama_models(ollama_ip)
-    selected_model = st.selectbox("選擇 LLM 模型", model_list)
-    
+    st.header("Settings")
+    compute_device, _ = detect_compute()
+    st.caption(f"Compute: `{compute_device}`")
+
     st.divider()
-    if st.button("📁 選擇月結單資料夾"):
-        folder_path = select_folder()
-        st.session_state['folder_path'] = folder_path
+    poppler_path = st.text_input(
+        "Poppler Path",
+        help=r"Path to Poppler 'bin' directory, e.g., C:\path\to\poppler-xx\bin",
+    )
+    st.session_state["poppler_path"] = poppler_path
 
-# 顯示已選路徑
-current_folder = st.session_state.get('folder_path', "未選擇資料夾")
-st.info(f"📍 當前處理路徑: `{current_folder}`")
+    st.divider()
+    st.subheader("OCR Performance")
+    ocr_dpi = 150
+    st.caption("OCR DPI is fixed to 150 for lower VRAM usage.")
+    max_pages = st.number_input(
+        "Max pages per PDF (0 = all pages)",
+        min_value=0,
+        max_value=500,
+        value=5,
+        step=1,
+    )
+    force_ocr = st.checkbox(
+        "Force OCR (skip text extraction)",
+        value=False,
+        help="Always use PaddleOCR on every page. Useful for scanned or complex-layout PDFs.",
+    )
+    use_ocr_cache = st.checkbox("Cache OCR result per PDF", value=True)
+    page_workers = st.slider("Page parallel workers", min_value=1, max_value=8, value=4, step=1)
 
-# --- 核心邏輯 ---
-if st.button("🚀 開始掃描並轉換", type="primary"):
-    if not os.path.exists(current_folder) or current_folder == "未選擇資料夾":
-        st.error("請先選擇一個有效的資料夾！")
+# Main page
+if st.button("Select PDF Files"):
+    files = select_pdf_files()
+    if files:
+        st.session_state["selected_pdfs"] = files
+
+selected_pdfs = st.session_state.get("selected_pdfs", [])
+if selected_pdfs:
+    st.info(f"{len(selected_pdfs)} PDF(s) selected:\n" + "\n".join(f"- `{os.path.basename(p)}`" for p in selected_pdfs))
+else:
+    st.info("No PDF files selected.")
+
+if st.button("Run Extraction", type="primary"):
+    if not selected_pdfs:
+        st.error("Please select at least one PDF file first.")
     else:
-        pdf_files = glob(os.path.join(current_folder, "*.pdf"))
+        pdf_files = [p for p in selected_pdfs if os.path.exists(p)]
         if not pdf_files:
-            st.warning("資料夾內冇 PDF 檔案。")
+            st.warning("None of the selected PDF files could be found.")
         else:
             progress_bar = st.progress(0)
             status_text = st.empty()
             all_results = []
-            
-            converter = DocumentConverter()
-            
+
+            paddle_ocr = load_paddle_ocr(use_gpu=(compute_device == "cuda"))
+            if paddle_ocr is None:
+                st.error("PaddleOCR failed to load. Check installation: pip install paddleocr")
+                st.stop()
+
             for idx, pdf in enumerate(pdf_files):
                 filename = os.path.basename(pdf)
-                status_text.text(f"正在處理 ({idx+1}/{len(pdf_files)}): {filename}")
-                
-                # 1. Docling 轉換
-                result = converter.convert(pdf)
-                md_text = result.document.export_to_markdown()
-                
-                # 2. Call Ollama
-                payload = {
-                    "model": selected_model,
-                    "prompt": f"""
-                    You are a professional bank auditor. Extract all "Interest Credit" entries from this statement.
-                    
-                    ### RULES:
-                    1. Look for keywords: "Interest", "INT", "CR", "利息", "存入利息".
-                    2. Identify the EXACT amount. Do NOT confuse "Balance" (large numbers) with "Interest" (small numbers).
-                    3. If the date format is inconsistent, normalize it to YYYY-MM-DD.
-                    4. RETURN ONLY A JSON ARRAY. No chat, no preamble.
-                    
-                    ### FORMAT EXAMPLE:
-                    [
-                      {{"date": "2024-04-30", "description": "INTEREST PAID", "amount": 16.49}}
-                    ]
-                
-                    ### TEXT TO ANALYZE:
-                    {md_text}
-                    """,
-                    "stream": False,
-                    "format": "json",
-                    "options": {
-                        "temperature": 0,      # 關閉隨機性，確保結果穩定
-                        "num_predict": 1000,   # 確保有足夠長度生完個 JSON
-                        "top_k": 20,           # 減少發散
-                        "top_p": 0.9
-                    }
-                }
-                
-                try:
-                    res = requests.post(f"{ollama_ip}/api/generate", json=payload)
-                    response_data = res.json().get('response', '[]').strip()
-                    
-                    # --- 強效清理步驟 ---
-                    # 1. 移除 JSON 以外嘅文字 (有時 LLM 會加 "Here is your JSON:")
-                    json_match = re.search(r'\[.*\]', response_data, re.DOTALL)
-                    if json_match:
-                        clean_json = json_match.group(0)
-                    else:
-                        clean_json = response_data
+                status_text.text(f"Processing ({idx + 1}/{len(pdf_files)}): {filename}")
 
-                    # 2. 處理常見語法錯誤：將單引號轉雙引號，移除尾隨逗號
-                    clean_json = clean_json.replace("'", '"')
-                    clean_json = re.sub(r',\s*\]', ']', clean_json) # 移除 [...,] 嘅逗號
-                    
-                    # 嘗試解析
-                    items = json.loads(clean_json)
-                    
-                    # --- 防錯檢查：確保 items 係一個 list ---
-                    if isinstance(items, list):
-                        for item in items:
-                            if isinstance(item, dict): # 確保入面係字典
-                                item['source'] = filename  # 呢度就係原本出錯嘅地方
-                                all_results.append(item)
-                    elif isinstance(items, dict): # 有時模型只會回傳單一物件
-                        items['source'] = filename
-                        all_results.append(items)
-                        
+                try:
+                    if use_ocr_cache:
+                        lines = ocr_pdf_to_lines_cached(
+                            pdf,
+                            _pdf_signature(pdf),
+                            poppler_path=st.session_state.get("poppler_path"),
+                            ocr_dpi=ocr_dpi,
+                            max_pages=max_pages,
+                            max_workers=page_workers,
+                            force_ocr=force_ocr,
+                        )
+                    else:
+                        lines = extract_pdf_lines_hybrid(
+                            pdf,
+                            poppler_path=st.session_state.get("poppler_path"),
+                            ocr_dpi=ocr_dpi,
+                            max_pages=max_pages,
+                            max_workers=page_workers,
+                            force_ocr=force_ocr,
+                            paddle_ocr=paddle_ocr,
+                        )
+
+                    records = extract_interest_from_lines(lines, filename)
+                    all_results.extend(records)
+
                 except Exception as e:
-                    st.error(f"分析 {filename} 時出錯: {e}")
-                    # 打印出嚟睇吓 LLM 到底俾咗咩你，方便除錯
-                    st.code(response_data, language="json")            
+                    st.error(f"Error in {filename}: {e}")
+
                 progress_bar.progress((idx + 1) / len(pdf_files))
 
-            # 3. 顯示結果
+            status_text.empty()
+
             if all_results:
                 df = pd.DataFrame(all_results)
-                
-                # --- 新增：欄位清洗機制 ---
-                # 預防模型俾錯名 (例如 '金額' -> 'amount')
-                rename_map = {
-                    '金額': 'amount', 
-                    'Value': 'amount', 
-                    'price': 'amount',
-                    '日期': 'date',
-                    'description': 'description',
-                    '項目': 'description'
-                }
-                df.rename(columns=rename_map, inplace=True)
+                df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
 
-                # 檢查 'amount' 欄位是否存在
-                if 'amount' in df.columns:
-                    # 去除數字入面的千分位逗號 (例如 1,234.50 -> 1234.50)
-                    df['amount'] = df['amount'].astype(str).str.replace(',', '').str.replace('$', '')
-                    df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
-                else:
-                    # 如果真係冇 amount 欄位，就補一個全 0 嘅俾佢，防止報錯
-                    df['amount'] = 0.0
-
-                st.success("✅ 處理完成！")
-                st.subheader("📊 利息收入匯總表")
+                st.success(f"Extraction completed — {len(df)} interest record(s) found.")
+                st.subheader("Interest Records")
                 st.dataframe(df, use_container_width=True)
-                
-                total = df['amount'].sum()
-                st.metric("全年總利息收入", f"${total:,.2f}")
+
+                total = df["amount"].sum()
+                st.metric("Total Interest", f"{total:,.2f}")
+
+                csv_data = df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    label="Download CSV",
+                    data=csv_data,
+                    file_name="interest_summary.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.warning("No interest records found.")
