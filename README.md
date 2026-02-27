@@ -14,7 +14,7 @@ A Streamlit web app that extracts interest credit transactions from bank PDF sta
 
 | Bank | Date format | Example line |
 |------|-------------|--------------|
-| Bangkok Bank | `DDMMMYY` | `01MAR24 0000 INTEREST 利息收入 6.76 9,728.25` |
+| HKbea Bank | `DDMMMYY` | `01MAR24 0000 INTEREST 利息收入 6.76 9,728.25` |
 | Citibank HK | `MM/DD/YY` | `01/31/24 01/31/24 存入利息 (JAN) 16.62 19,678.26` |
 
 Amount detection: the **second-to-last** decimal number on the line is taken as the transaction amount; the last is the running balance.
