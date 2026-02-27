@@ -15,10 +15,6 @@ try:
 except Exception:
     pdfium = None
 try:
-    import fitz  # PyMuPDF
-except Exception:
-    fitz = None
-try:
     import pdfplumber
 except Exception:
     pdfplumber = None
@@ -140,10 +136,7 @@ def _paddle_ocr_image_to_lines(image, paddle_ocr):
 
 
 def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages=0, max_workers=4, force_ocr=False, paddle_ocr=None):
-    if fitz is not None:
-        with fitz.open(pdf_path) as doc:
-            page_count = doc.page_count
-    elif pdfium is not None:
+    if pdfium is not None:
         doc = pdfium.PdfDocument(pdf_path)
         page_count = len(doc)
         doc.close()
@@ -166,12 +159,8 @@ def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages
                     page_text = plumb_doc.pages[page_idx].extract_text() or ""
             except Exception:
                 page_text = ""
-        if not page_text and fitz is not None:
-            with fitz.open(pdf_path) as fdoc:
-                page_text = fdoc.load_page(page_idx).get_text("text") or ""
         if _is_substantial_text(page_text) and not _is_gibberish_text(page_text):
-            engine = "pdfplumber" if pdfplumber is not None else "PyMuPDF"
-            print(f"[OCR] Page {page_idx + 1}: text extracted via {engine} ({len(page_text)} chars)")
+            print(f"[OCR] Page {page_idx + 1}: text extracted via pdfplumber ({len(page_text)} chars)")
             extracted_lines = [ln.strip() for ln in page_text.splitlines() if ln and ln.strip()]
             return page_idx, extracted_lines, False
         print(f"[OCR] Page {page_idx + 1}: text extraction insufficient → queued for OCR")

@@ -82,7 +82,6 @@ Open `http://<host-ip>:8501`.
 |---------|---------|
 | streamlit | Web UI |
 | pdfplumber | Digital PDF text extraction (preserves column order) |
-| PyMuPDF | Fallback text extraction |
 | pypdfium2 | PDF page rendering for OCR |
 | pdf2image | PDF to image conversion (requires Poppler) |
 | paddleocr 2.7.3 | OCR for scanned pages |
