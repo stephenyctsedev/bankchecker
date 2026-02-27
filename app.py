@@ -127,17 +127,21 @@ def get_ollama_models(base_url: str):
         return ["Could not fetch models - check Ollama URL"]
 
 
-def select_folder():
+def select_pdf_files():
     if tk is None or filedialog is None:
         st.error("tkinter is not available in this environment.")
-        return ""
+        return []
 
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    folder_selected = filedialog.askdirectory(master=root)
+    files_selected = filedialog.askopenfilenames(
+        master=root,
+        title="Select PDF files",
+        filetypes=[("PDF files", "*.pdf")],
+    )
     root.destroy()
-    return folder_selected
+    return list(files_selected)
 
 
 def _pdf_signature(pdf_path: str) -> str:
@@ -209,7 +213,7 @@ def _ocr_image_to_lines(image, models, math_mode=False):
     return out
 
 
-def extract_pdf_lines_hybrid(pdf_path, models, poppler_path=None, ocr_dpi=150, max_pages=0, math_mode=False, max_workers=4):
+def extract_pdf_lines_hybrid(pdf_path, models, poppler_path=None, ocr_dpi=150, max_pages=0, math_mode=False, max_workers=4, force_ocr=False):
     if fitz is not None:
         with fitz.open(pdf_path) as doc:
             page_count = doc.page_count
@@ -226,6 +230,8 @@ def extract_pdf_lines_hybrid(pdf_path, models, poppler_path=None, ocr_dpi=150, m
         return []
 
     def _process_text_page(page_idx):
+        if force_ocr:
+            return page_idx, [], True
         page_text = ""
         if fitz is not None:
             with fitz.open(pdf_path) as fdoc:
@@ -360,6 +366,7 @@ def ocr_pdf_to_lines_cached(
     max_pages=0,
     math_mode=False,
     max_workers=4,
+    force_ocr=False,
 ):
     _ = pdf_signature
     device, _ollama_num_gpu = detect_compute()
@@ -374,6 +381,7 @@ def ocr_pdf_to_lines_cached(
         max_pages=max_pages,
         math_mode=math_mode,
         max_workers=max_workers,
+        force_ocr=force_ocr,
     )
 
 
@@ -389,15 +397,110 @@ def pil_to_base64_jpeg(image, quality=75, max_side=1600):
 
 
 def parse_json_array(text):
-    text = (text or "").strip()
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    candidate = match.group(0) if match else text
-    data = json.loads(candidate or "[]")
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return [data]
+    raw = (text or "").strip()
+    if not raw:
+        return []
+
+    # Remove markdown fences.
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    candidates = [cleaned]
+    arr_match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+    if arr_match:
+        candidates.append(arr_match.group(0))
+    obj_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if obj_match:
+        candidates.append(obj_match.group(0))
+
+    def _extract_balanced(s, open_ch, close_ch):
+        start = s.find(open_ch)
+        if start < 0:
+            return ""
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+        return ""
+
+    bal_arr = _extract_balanced(cleaned, "[", "]")
+    if bal_arr:
+        candidates.append(bal_arr)
+    bal_obj = _extract_balanced(cleaned, "{", "}")
+    if bal_obj:
+        candidates.append(bal_obj)
+
+    for c in candidates:
+        c = c.strip()
+        if not c:
+            continue
+        try:
+            data = json.loads(c)
+        except Exception:
+            # common cleanup: trailing commas before ] or }
+            try:
+                data = json.loads(re.sub(r",\s*([}\]])", r"\1", c))
+            except Exception:
+                continue
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            # Common model wrappers.
+            for key in ("records", "items", "data", "results", "transactions"):
+                wrapped = data.get(key)
+                if isinstance(wrapped, list):
+                    return wrapped
+            return [data]
     return []
+
+
+def repair_json_with_ollama(ollama_ip, model, bad_output, timeout_sec=120, num_gpu=0):
+    repair_prompt = f"""
+Convert the following content into a STRICT JSON array only.
+
+Rules:
+1. Output must be valid JSON.
+2. Output must be an array, e.g. [{{...}}, {{...}}]
+3. No markdown, no explanation, no extra text.
+4. If content has no valid transaction records, output [].
+
+Content:
+{bad_output}
+""".strip()
+    payload = {
+        "model": model,
+        "prompt": repair_prompt,
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0,
+            "num_predict": 1200,
+            "num_gpu": int(num_gpu),
+        },
+    }
+    res = requests.post(f"{ollama_ip}/api/generate", json=payload, timeout=int(timeout_sec))
+    res.raise_for_status()
+    try:
+        repaired_text = res.json().get("response", "[]")
+    except Exception:
+        repaired_text = res.text
+    return parse_json_array((repaired_text or "").strip())
 
 
 def extract_interest_from_vision_page(
@@ -528,7 +631,25 @@ def call_ollama_json_with_retry(ollama_ip, payload, timeout_sec=180, retries=2):
         try:
             res = requests.post(f"{ollama_ip}/api/generate", json=payload, timeout=int(timeout_sec))
             res.raise_for_status()
-            return parse_json_array(res.json().get("response", "[]").strip())
+            try:
+                response_text = res.json().get("response", "[]")
+            except Exception:
+                # fallback when server returns a malformed wrapper JSON
+                response_text = res.text
+            parsed = parse_json_array((response_text or "").strip())
+            if parsed:
+                return parsed
+            # Automatic repair pass: ask model to convert output to strict JSON.
+            repaired = repair_json_with_ollama(
+                ollama_ip=ollama_ip,
+                model=payload.get("model", "llama3.2:3b"),
+                bad_output=(response_text or "").strip(),
+                timeout_sec=min(int(timeout_sec), 180),
+                num_gpu=payload.get("options", {}).get("num_gpu", 0),
+            )
+            if repaired:
+                return repaired
+            raise ValueError("Unable to parse valid JSON array from model output.")
         except requests.exceptions.ReadTimeout as e:
             last_err = e
             if attempt < int(retries):
@@ -540,6 +661,9 @@ def call_ollama_json_with_retry(ollama_ip, payload, timeout_sec=180, retries=2):
             ) from e
         except Exception as e:
             last_err = e
+            if attempt < int(retries):
+                time.sleep(1.0 * (attempt + 1))
+                continue
             break
     raise RuntimeError(f"Ollama call failed: {last_err}")
 
@@ -563,10 +687,20 @@ with st.sidebar:
     )
 
     st.divider()
-    if st.button("Select PDF Folder"):
-        folder_path = select_folder()
-        if folder_path:
-            st.session_state["folder_path"] = folder_path
+    if st.button("Select PDF Files"):
+        files = select_pdf_files()
+        if files:
+            st.session_state["selected_pdfs"] = files
+
+    if extraction_mode == "Surya OCR + Text LLM":
+        if st.button("Pre-load OCR Models", help="Load Surya OCR models into GPU memory now so the first extraction run starts immediately."):
+            with st.spinner("Loading Surya OCR models..."):
+                _device, _ = detect_compute()
+                _models = load_surya_models(device=_device)
+            if all(_models):
+                st.success("OCR models loaded and ready.")
+            else:
+                st.error("Failed to load OCR models. Check dependencies.")
 
     st.divider()
     poppler_path = st.text_input(
@@ -585,6 +719,7 @@ with st.sidebar:
         value=5,
         step=1,
     )
+    force_ocr = st.checkbox("Force OCR (skip PyMuPDF text extraction)", value=False, help="Always use Surya OCR on every page. Slower but more accurate for scanned or complex-layout PDFs.")
     math_mode = st.checkbox("Enable math mode (slower)", value=False)
     use_ocr_cache = st.checkbox("Cache OCR result per PDF", value=True)
     page_workers = st.slider("Page parallel workers", min_value=1, max_value=8, value=4, step=1)
@@ -624,7 +759,7 @@ with st.sidebar:
         "Text LLM timeout (seconds)",
         min_value=60,
         max_value=1200,
-        value=360,
+        value=600,
         step=30,
     )
     text_llm_retries = st.number_input(
@@ -642,16 +777,19 @@ with st.sidebar:
         step=100,
     )
 
-current_folder = st.session_state.get("folder_path", "No folder selected")
-st.info(f"Current folder: `{current_folder}`")
+selected_pdfs = st.session_state.get("selected_pdfs", [])
+if selected_pdfs:
+    st.info(f"{len(selected_pdfs)} PDF(s) selected:\n" + "\n".join(f"- `{os.path.basename(p)}`" for p in selected_pdfs))
+else:
+    st.info("No PDF files selected.")
 
 if st.button("Run Extraction", type="primary"):
-    if not os.path.exists(current_folder) or current_folder == "No folder selected":
-        st.error("Please select a valid folder first.")
+    if not selected_pdfs:
+        st.error("Please select at least one PDF file first.")
     else:
-        pdf_files = glob(os.path.join(current_folder, "*.pdf"))
+        pdf_files = [p for p in selected_pdfs if os.path.exists(p)]
         if not pdf_files:
-            st.warning("No PDF files found in selected folder.")
+            st.warning("None of the selected PDF files could be found.")
         else:
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -682,6 +820,7 @@ if st.button("Run Extraction", type="primary"):
                                 max_pages=max_pages,
                                 math_mode=math_mode,
                                 max_workers=page_workers,
+                                force_ocr=force_ocr,
                             )
                         else:
                             lines = extract_pdf_lines_hybrid(
@@ -692,6 +831,7 @@ if st.button("Run Extraction", type="primary"):
                                 max_pages=max_pages,
                                 math_mode=math_mode,
                                 max_workers=page_workers,
+                                force_ocr=force_ocr,
                             )
 
                         page_text = "\n".join(lines)
@@ -733,7 +873,7 @@ if st.button("Run Extraction", type="primary"):
                 progress_bar.progress((idx + 1) / len(pdf_files))
 
             if extraction_mode == "Surya OCR + Text LLM":
-                unload_surya_models(models)
+                unload_surya_models(models)  # always free GPU before LLM call
                 if all_snippets:
                     combined_context = "\n\n".join(all_snippets)
                     combined_context, was_truncated = truncate_text_to_tokens(
@@ -741,6 +881,12 @@ if st.button("Run Extraction", type="primary"):
                     )
                     if was_truncated:
                         st.info(f"Combined context exceeded {int(text_token_limit)} tokens and was truncated.")
+                    approx_tokens = len(combined_context.split())
+                    print(f"\n{'='*60}")
+                    print(f"[DEBUG] Combined context sent to LLM (~{approx_tokens} tokens, truncated={was_truncated}):")
+                    print(f"{'='*60}")
+                    print(combined_context)
+                    print(f"{'='*60}\n")
                     prompt = f"""
 You are a professional bank auditor. Extract all interest-credit transactions from the combined context.
 
