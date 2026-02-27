@@ -35,20 +35,17 @@ try:
 except Exception:
     fitz = None
 try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+try:
+    from paddleocr import PaddleOCR as _PaddleOCR
+except Exception:
+    _PaddleOCR = None
+try:
     import torch
 except Exception:
     torch = None
-
-SURYA_IMPORT_ERROR = None
-try:
-    from surya.detection import DetectionPredictor
-    from surya.foundation import FoundationPredictor
-    from surya.recognition import RecognitionPredictor
-except Exception as e:
-    SURYA_IMPORT_ERROR = str(e)
-    FoundationPredictor = None
-    DetectionPredictor = None
-    RecognitionPredictor = None
 
 st.set_page_config(page_title="Bank Statement Interest Checker", page_icon="PDF", layout="wide")
 
@@ -64,57 +61,6 @@ def detect_compute():
     except Exception:
         pass
     return "cpu", 0
-
-
-@st.cache_resource(show_spinner="Loading Surya OCR models...")
-def load_surya_models(device="cpu"):
-    if SURYA_IMPORT_ERROR:
-        st.error(f"Surya OCR import failed: {SURYA_IMPORT_ERROR}")
-        if "torchvision::nms" in SURYA_IMPORT_ERROR or "PreTrainedModel" in SURYA_IMPORT_ERROR:
-            st.code(
-                "pip uninstall -y torchvision\n"
-                "pip install --upgrade torch transformers surya-ocr",
-                language="bash",
-            )
-            st.info(
-                "Detected a torch/torchvision mismatch. "
-                "torchvision is optional for this app and can be removed."
-            )
-        else:
-            st.info("Install Surya with: pip install surya-ocr")
-        return None, None, None
-
-    try:
-        foundation = FoundationPredictor(device=device)
-        det_predictor = DetectionPredictor(device=device)
-        rec_predictor = RecognitionPredictor(foundation)
-        return foundation, det_predictor, rec_predictor
-    except Exception as e:
-        err_text = str(e)
-        if isinstance(e, OSError) and getattr(e, "errno", None) == 22:
-            cache_root = platformdirs.user_cache_dir("datalab")
-            models_cache = os.path.join(cache_root, "datalab", "Cache", "models")
-            st.warning(
-                f"Surya model cache may be corrupted on Windows (Errno 22). "
-                f"Clearing cache and retrying once: {models_cache}"
-            )
-            try:
-                if os.path.exists(models_cache):
-                    shutil.rmtree(models_cache, ignore_errors=True)
-
-                foundation = FoundationPredictor(device=device)
-                det_predictor = DetectionPredictor(device=device)
-                rec_predictor = RecognitionPredictor(foundation)
-                st.success("Surya OCR models initialized after cache reset.")
-                return foundation, det_predictor, rec_predictor
-            except Exception as retry_err:
-                st.error(f"Retry after cache reset failed: {retry_err}")
-                st.code(traceback.format_exc(), language="text")
-                return None, None, None
-
-        st.error(f"Failed to initialize Surya OCR models: {err_text}")
-        st.code(traceback.format_exc(), language="text")
-        return None, None, None
 
 
 def get_ollama_models(base_url: str):
@@ -192,28 +138,28 @@ def _render_single_page_image(pdf_path, page_index, dpi=150, poppler_path=None):
         doc.close()
 
 
-def _ocr_image_to_lines(image, models, math_mode=False):
-    foundation, det_predictor, rec_predictor = models
-    if not all([foundation, det_predictor, rec_predictor]):
-        return []
-    predictions = rec_predictor(
-        [image],
-        det_predictor=det_predictor,
-        sort_lines=False,
-        math_mode=math_mode,
-    )
-    out = []
-    if predictions:
-        for line_obj in predictions[0].text_lines:
-            text = getattr(line_obj, "text", "")
-            if text:
-                out.append(text)
-    if torch is not None and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return out
+def _paddle_ocr_image_to_lines(image, paddle_ocr):
+    """Run PaddleOCR on a PIL image; returns list of text lines or None on failure."""
+    if paddle_ocr is None:
+        return None
+    try:
+        import numpy as np
+        result = paddle_ocr.ocr(np.array(image), cls=True)
+        if not result or not result[0]:
+            return []
+        lines = []
+        for line in result[0]:
+            if line and len(line) >= 2:
+                text = line[1][0] if isinstance(line[1], (list, tuple)) else ""
+                if text:
+                    lines.append(str(text))
+        return lines
+    except Exception as e:
+        print(f"[OCR] PaddleOCR inference error: {e}")
+        return None  # signal failure → caller falls back to Surya OCR
 
 
-def extract_pdf_lines_hybrid(pdf_path, models, poppler_path=None, ocr_dpi=150, max_pages=0, math_mode=False, max_workers=4, force_ocr=False):
+def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages=0, max_workers=4, force_ocr=False, paddle_ocr=None):
     if fitz is not None:
         with fitz.open(pdf_path) as doc:
             page_count = doc.page_count
@@ -231,14 +177,26 @@ def extract_pdf_lines_hybrid(pdf_path, models, poppler_path=None, ocr_dpi=150, m
 
     def _process_text_page(page_idx):
         if force_ocr:
+            print(f"[OCR] Page {page_idx + 1}: force_ocr=True → queued for OCR")
             return page_idx, [], True
         page_text = ""
-        if fitz is not None:
+        # pdfplumber preserves table/column row order better than PyMuPDF
+        if pdfplumber is not None:
+            try:
+                with pdfplumber.open(pdf_path) as plumb_doc:
+                    page_text = plumb_doc.pages[page_idx].extract_text() or ""
+            except Exception:
+                page_text = ""
+        # fall back to PyMuPDF if pdfplumber unavailable or returned nothing
+        if not page_text and fitz is not None:
             with fitz.open(pdf_path) as fdoc:
                 page_text = fdoc.load_page(page_idx).get_text("text") or ""
         if _is_substantial_text(page_text) and not _is_gibberish_text(page_text):
+            engine = "pdfplumber" if pdfplumber is not None else "PyMuPDF"
+            print(f"[OCR] Page {page_idx + 1}: text extracted via {engine} ({len(page_text)} chars)")
             extracted_lines = [ln.strip() for ln in page_text.splitlines() if ln and ln.strip()]
             return page_idx, extracted_lines, False
+        print(f"[OCR] Page {page_idx + 1}: text extraction insufficient → queued for OCR")
         return page_idx, [], True
 
     results = {}
@@ -252,7 +210,7 @@ def extract_pdf_lines_hybrid(pdf_path, models, poppler_path=None, ocr_dpi=150, m
             if needs_ocr:
                 ocr_needed_pages.append(page_idx)
 
-    # Surya predictors are not reliably thread-safe. Run OCR fallback sequentially.
+    # Run OCR fallback sequentially using PaddleOCR.
     for page_idx in sorted(ocr_needed_pages):
         img = _render_single_page_image(
             pdf_path,
@@ -260,7 +218,18 @@ def extract_pdf_lines_hybrid(pdf_path, models, poppler_path=None, ocr_dpi=150, m
             dpi=ocr_dpi,
             poppler_path=poppler_path,
         )
-        results[page_idx] = _ocr_image_to_lines(img, models, math_mode=math_mode)
+        paddle_lines = _paddle_ocr_image_to_lines(img, paddle_ocr)
+        if paddle_lines is not None:
+            joined = "\n".join(paddle_lines)
+            if _is_substantial_text(joined) and not _is_gibberish_text(joined):
+                print(f"[OCR] Page {page_idx + 1}: used PaddleOCR ({len(paddle_lines)} lines)")
+                results[page_idx] = paddle_lines
+                continue
+            else:
+                print(f"[OCR] Page {page_idx + 1}: PaddleOCR output insufficient, page skipped")
+        else:
+            print(f"[OCR] Page {page_idx + 1}: PaddleOCR unavailable/failed, page skipped")
+        results[page_idx] = []
 
     lines = []
     for i in range(page_count):
@@ -268,93 +237,33 @@ def extract_pdf_lines_hybrid(pdf_path, models, poppler_path=None, ocr_dpi=150, m
     return lines
 
 
-def unload_surya_models(models):
-    try:
-        load_surya_models.clear()
-    except Exception:
-        pass
-    try:
-        foundation, det_predictor, rec_predictor = models
-        del foundation
-        del det_predictor
-        del rec_predictor
-    except Exception:
-        pass
-    gc.collect()
-    if torch is not None and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-def render_pdf_to_images(pdf_path, poppler_path=None, dpi=150, max_pages=0):
-    pages = []
-    if convert_from_path is not None:
-        try:
-            last_page = int(max_pages) if max_pages and max_pages > 0 else None
-            pages = convert_from_path(
-                pdf_path,
-                dpi=dpi,
-                poppler_path=poppler_path or None,
-                first_page=1,
-                last_page=last_page,
-            )
-        except Exception as e:
-            # Fall back to pypdfium2 if Poppler is not installed or not in PATH.
-            if pdfium is None:
-                raise RuntimeError(
-                    "Failed to convert PDF pages. Poppler was not found and pypdfium2 is unavailable. "
-                    f"Details: {e}"
-                )
-    if not pages:
-        if pdfium is None:
-            raise RuntimeError(
-                "PDF conversion failed. Install Poppler (pdftoppm) or install pypdfium2."
-            )
-        try:
-            doc = pdfium.PdfDocument(pdf_path)
-            scale = dpi / 72
-            page_count = len(doc)
-            if max_pages and max_pages > 0:
-                page_count = min(page_count, int(max_pages))
-            for i in range(page_count):
-                page = doc[i]
-                pil_img = page.render(scale=scale).to_pil()
-                pages.append(pil_img)
-                page.close()
-            doc.close()
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to convert PDF pages with both pdf2image and pypdfium2. "
-                f"Details: {e}"
-            )
-
-    if not pages:
-        return []
-    if max_pages and max_pages > 0:
-        pages = pages[: int(max_pages)]
-    return pages
-
-
-def ocr_pdf_to_lines(pdf_path, models, poppler_path=None, ocr_dpi=150, max_pages=0, math_mode=False):
-    foundation, det_predictor, rec_predictor = models
-    if not all([foundation, det_predictor, rec_predictor]):
-        raise RuntimeError("Surya OCR models are not ready.")
-
-    pages = render_pdf_to_images(pdf_path, poppler_path=poppler_path, dpi=ocr_dpi, max_pages=max_pages)
-
-    predictions = rec_predictor(
-        pages,
-        det_predictor=det_predictor,
-        sort_lines=False,
-        math_mode=math_mode,
-    )
-
-    lines = []
-    for page_result in predictions:
-        for line_obj in page_result.text_lines:
-            text = getattr(line_obj, "text", "")
-            if text:
-                lines.append(text)
-    return lines
+@st.cache_resource(show_spinner=False)
+def load_paddle_ocr(use_gpu=False):
+    if _PaddleOCR is None:
+        return None
+    gpu_variants = (
+        [{"device": "gpu"}, {"use_gpu": True}] if use_gpu else []
+    ) + [{}]
+    # Try progressively simpler configs across PaddleOCR 3.x and 2.x APIs
+    base_options = [
+        {"use_textline_orientation": True, "lang": "en"},  # PaddleOCR 3.x
+        {"use_angle_cls": True, "lang": "en"},             # PaddleOCR 2.x
+        {"lang": "en"},                                    # minimal fallback
+    ]
+    last_err = None
+    for base in base_options:
+        for extra in gpu_variants:
+            try:
+                ocr = _PaddleOCR(**base, **extra)
+                print(f"[OCR] PaddleOCR loaded — base={base} gpu={extra or 'auto'}")
+                return ocr
+            except TypeError:
+                continue
+            except Exception as e:
+                last_err = e
+                break  # non-TypeError: try simpler base, not another GPU variant
+    print(f"[OCR] PaddleOCR failed to load: {last_err}")
+    return None
 
 
 @st.cache_data(show_spinner=False)
@@ -364,36 +273,21 @@ def ocr_pdf_to_lines_cached(
     poppler_path=None,
     ocr_dpi=150,
     max_pages=0,
-    math_mode=False,
     max_workers=4,
     force_ocr=False,
 ):
     _ = pdf_signature
-    device, _ollama_num_gpu = detect_compute()
-    models = load_surya_models(device=device)
-    if not all(models):
-        return []
+    device, _ = detect_compute()
+    paddle_ocr = load_paddle_ocr(use_gpu=(device == "cuda"))
     return extract_pdf_lines_hybrid(
         pdf_path,
-        models,
         poppler_path=poppler_path,
         ocr_dpi=ocr_dpi,
         max_pages=max_pages,
-        math_mode=math_mode,
         max_workers=max_workers,
         force_ocr=force_ocr,
+        paddle_ocr=paddle_ocr,
     )
-
-
-def pil_to_base64_jpeg(image, quality=75, max_side=1600):
-    w, h = image.size
-    longest = max(w, h)
-    if longest > max_side and max_side > 0:
-        scale = max_side / float(longest)
-        image = image.resize((int(w * scale), int(h * scale)))
-    buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def parse_json_array(text):
@@ -503,66 +397,6 @@ Content:
     return parse_json_array((repaired_text or "").strip())
 
 
-def extract_interest_from_vision_page(
-    ollama_ip,
-    selected_model,
-    page_img,
-    request_timeout=300,
-    max_retries=2,
-    jpeg_quality=70,
-    image_max_side=1600,
-    ollama_num_gpu=0,
-):
-    image_b64 = pil_to_base64_jpeg(page_img, quality=jpeg_quality, max_side=image_max_side)
-    prompt = """
-You are a bank statement auditor.
-Analyze this statement page image and extract ONLY interest-credit transactions.
-
-Rules:
-1. Include only entries clearly related to interest paid/credited/income.
-2. Ignore balances, totals, and non-interest rows.
-3. If uncertain, skip.
-4. Date format must be YYYY-MM-DD when possible.
-5. amount must be numeric, no currency symbol.
-
-Return ONLY a JSON array:
-[
-  {"date":"2024-04-30","description":"INTEREST PAID","amount":16.49}
-]
-
-If no interest row exists, return [].
-""".strip()
-    payload = {
-        "model": selected_model,
-        "prompt": prompt,
-        "images": [image_b64],
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0, "num_predict": 1000},
-    }
-    payload["options"]["num_gpu"] = int(ollama_num_gpu)
-    last_err = None
-    for attempt in range(max_retries + 1):
-        try:
-            res = requests.post(f"{ollama_ip}/api/generate", json=payload, timeout=request_timeout)
-            res.raise_for_status()
-            response_data = res.json().get("response", "[]")
-            return parse_json_array(response_data)
-        except requests.exceptions.ReadTimeout as e:
-            last_err = e
-            if attempt < max_retries:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            raise RuntimeError(
-                f"Ollama read timeout after {request_timeout}s (retries={max_retries}). "
-                "Try lower DPI/max pages, smaller image size, or higher timeout."
-            ) from e
-        except Exception as e:
-            last_err = e
-            break
-    raise RuntimeError(f"Vision extraction failed: {last_err}")
-
-
 def filter_interest_context(lines, token_limit=1000):
     if not lines:
         return "", False
@@ -669,7 +503,7 @@ def call_ollama_json_with_retry(ollama_ip, payload, timeout_sec=180, retries=2):
 
 
 st.title("Bank Statement Interest Checker")
-st.markdown("Use pdf2image + Surya OCR to read PDFs and Ollama to extract interest credits.")
+st.markdown("Use pdfplumber + PaddleOCR to read PDFs and Ollama to extract interest credits.")
 
 with st.sidebar:
     st.header("Settings")
@@ -681,26 +515,6 @@ with st.sidebar:
     selected_model = st.selectbox("LLM Model", model_list, index=default_model_index)
     compute_device, ollama_num_gpu = detect_compute()
     st.caption(f"Compute: `{compute_device}` | Ollama num_gpu: `{ollama_num_gpu}`")
-    extraction_mode = st.radio(
-        "Extraction Mode",
-        ["Surya OCR + Text LLM", "Vision Model (PDF images)"],
-    )
-
-    st.divider()
-    if st.button("Select PDF Files"):
-        files = select_pdf_files()
-        if files:
-            st.session_state["selected_pdfs"] = files
-
-    if extraction_mode == "Surya OCR + Text LLM":
-        if st.button("Pre-load OCR Models", help="Load Surya OCR models into GPU memory now so the first extraction run starts immediately."):
-            with st.spinner("Loading Surya OCR models..."):
-                _device, _ = detect_compute()
-                _models = load_surya_models(device=_device)
-            if all(_models):
-                st.success("OCR models loaded and ready.")
-            else:
-                st.error("Failed to load OCR models. Check dependencies.")
 
     st.divider()
     poppler_path = st.text_input(
@@ -719,40 +533,9 @@ with st.sidebar:
         value=5,
         step=1,
     )
-    force_ocr = st.checkbox("Force OCR (skip PyMuPDF text extraction)", value=False, help="Always use Surya OCR on every page. Slower but more accurate for scanned or complex-layout PDFs.")
-    math_mode = st.checkbox("Enable math mode (slower)", value=False)
+    force_ocr = st.checkbox("Force OCR (skip text extraction)", value=False, help="Always use PaddleOCR on every page. More accurate for scanned or complex-layout PDFs.")
     use_ocr_cache = st.checkbox("Cache OCR result per PDF", value=True)
     page_workers = st.slider("Page parallel workers", min_value=1, max_value=8, value=4, step=1)
-    st.divider()
-    st.subheader("Vision Settings")
-    vision_timeout = st.number_input(
-        "Vision timeout per page (seconds)",
-        min_value=60,
-        max_value=1200,
-        value=300,
-        step=30,
-    )
-    vision_retries = st.number_input(
-        "Vision retries per page",
-        min_value=0,
-        max_value=5,
-        value=2,
-        step=1,
-    )
-    vision_image_max_side = st.slider(
-        "Vision image max side (px)",
-        min_value=900,
-        max_value=2500,
-        value=1600,
-        step=100,
-    )
-    vision_jpeg_quality = st.slider(
-        "Vision JPEG quality",
-        min_value=50,
-        max_value=95,
-        value=70,
-        step=5,
-    )
     st.divider()
     st.subheader("Text LLM Settings")
     text_llm_timeout = st.number_input(
@@ -777,6 +560,11 @@ with st.sidebar:
         step=100,
     )
 
+if st.button("Select PDF Files"):
+    files = select_pdf_files()
+    if files:
+        st.session_state["selected_pdfs"] = files
+
 selected_pdfs = st.session_state.get("selected_pdfs", [])
 if selected_pdfs:
     st.info(f"{len(selected_pdfs)} PDF(s) selected:\n" + "\n".join(f"- `{os.path.basename(p)}`" for p in selected_pdfs))
@@ -794,15 +582,10 @@ if st.button("Run Extraction", type="primary"):
             progress_bar = st.progress(0)
             status_text = st.empty()
             all_results = []
-            models = (None, None, None)
-            if extraction_mode == "Surya OCR + Text LLM":
-                models = load_surya_models(device=compute_device)
-                if not all(models):
-                    st.error("OCR model load failed. Please fix dependencies and retry.")
-                    st.stop()
-
-            if extraction_mode == "Vision Model (PDF images)" and "vision" not in selected_model.lower():
-                st.warning("Selected model may not support images. Recommended: llama3.2-vision:11b")
+            paddle_ocr = load_paddle_ocr(use_gpu=(compute_device == "cuda"))
+            if paddle_ocr is None:
+                st.error("PaddleOCR failed to load. Check installation: pip install paddleocr")
+                st.stop()
 
             all_snippets = []
             for idx, pdf in enumerate(pdf_files):
@@ -810,84 +593,53 @@ if st.button("Run Extraction", type="primary"):
                 status_text.text(f"Processing ({idx + 1}/{len(pdf_files)}): {filename}")
 
                 try:
-                    if extraction_mode == "Surya OCR + Text LLM":
-                        if use_ocr_cache:
-                            lines = ocr_pdf_to_lines_cached(
-                                pdf,
-                                _pdf_signature(pdf),
-                                poppler_path=st.session_state.get("poppler_path"),
-                                ocr_dpi=ocr_dpi,
-                                max_pages=max_pages,
-                                math_mode=math_mode,
-                                max_workers=page_workers,
-                                force_ocr=force_ocr,
-                            )
-                        else:
-                            lines = extract_pdf_lines_hybrid(
-                                pdf,
-                                models,
-                                poppler_path=st.session_state.get("poppler_path"),
-                                ocr_dpi=ocr_dpi,
-                                max_pages=max_pages,
-                                math_mode=math_mode,
-                                max_workers=page_workers,
-                                force_ocr=force_ocr,
-                            )
-
-                        page_text = "\n".join(lines)
-                        snippets = get_context_snippets(page_text)
-                        if not snippets:
-                            progress_bar.progress((idx + 1) / len(pdf_files))
-                            continue
-                        all_snippets.append(f"[FILE: {filename}]\n" + "\n".join(snippets))
+                    if use_ocr_cache:
+                        lines = ocr_pdf_to_lines_cached(
+                            pdf,
+                            _pdf_signature(pdf),
+                            poppler_path=st.session_state.get("poppler_path"),
+                            ocr_dpi=ocr_dpi,
+                            max_pages=max_pages,
+                            max_workers=page_workers,
+                            force_ocr=force_ocr,
+                        )
                     else:
-                        pages = render_pdf_to_images(
+                        lines = extract_pdf_lines_hybrid(
                             pdf,
                             poppler_path=st.session_state.get("poppler_path"),
-                            dpi=ocr_dpi,
+                            ocr_dpi=ocr_dpi,
                             max_pages=max_pages,
+                            max_workers=page_workers,
+                            force_ocr=force_ocr,
+                            paddle_ocr=paddle_ocr,
                         )
-                        for page_idx, page_img in enumerate(pages, start=1):
-                            try:
-                                page_items = extract_interest_from_vision_page(
-                                    ollama_ip=ollama_ip,
-                                    selected_model=selected_model,
-                                    page_img=page_img,
-                                    request_timeout=int(vision_timeout),
-                                    max_retries=int(vision_retries),
-                                    jpeg_quality=int(vision_jpeg_quality),
-                                    image_max_side=int(vision_image_max_side),
-                                    ollama_num_gpu=int(ollama_num_gpu),
-                                )
-                                for item in page_items:
-                                    if isinstance(item, dict):
-                                        item["source"] = filename
-                                        item["page"] = page_idx
-                                        all_results.append(item)
-                            except Exception as page_err:
-                                st.warning(f"{filename} page {page_idx}: {page_err}")
+
+                    page_text = "\n".join(lines)
+                    snippets = get_context_snippets(page_text)
+                    if not snippets:
+                        progress_bar.progress((idx + 1) / len(pdf_files))
+                        continue
+                    all_snippets.append(f"[FILE: {filename}]\n" + "\n".join(snippets))
 
                 except Exception as e:
                     st.error(f"Error in {filename}: {e}")
 
                 progress_bar.progress((idx + 1) / len(pdf_files))
 
-            if extraction_mode == "Surya OCR + Text LLM":
-                unload_surya_models(models)  # always free GPU before LLM call
-                if all_snippets:
-                    combined_context = "\n\n".join(all_snippets)
-                    combined_context, was_truncated = truncate_text_to_tokens(
-                        combined_context, token_limit=int(text_token_limit)
-                    )
-                    if was_truncated:
-                        st.info(f"Combined context exceeded {int(text_token_limit)} tokens and was truncated.")
-                    approx_tokens = len(combined_context.split())
-                    print(f"\n{'='*60}")
-                    print(f"[DEBUG] Combined context sent to LLM (~{approx_tokens} tokens, truncated={was_truncated}):")
-                    print(f"{'='*60}")
-                    print(combined_context)
-                    print(f"{'='*60}\n")
-                    prompt = f"""
+            if all_snippets:
+                combined_context = "\n\n".join(all_snippets)
+                combined_context, was_truncated = truncate_text_to_tokens(
+                    combined_context, token_limit=int(text_token_limit)
+                )
+                if was_truncated:
+                    st.info(f"Combined context exceeded {int(text_token_limit)} tokens and was truncated.")
+                approx_tokens = len(combined_context.split())
+                print(f"\n{'='*60}")
+                print(f"[DEBUG] Combined context sent to LLM (~{approx_tokens} tokens, truncated={was_truncated}):")
+                print(f"{'='*60}")
+                print(combined_context)
+                print(f"{'='*60}\n")
+                prompt = f"""
 You are a professional bank auditor. Extract all interest-credit transactions from the combined context.
 
 Return ONLY a JSON array.
@@ -903,29 +655,29 @@ If unsure, skip.
 Context:
 {combined_context}
 """.strip()
-                    payload = {
-                        "model": selected_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "format": "json",
-                        "options": {
-                            "temperature": 0,
-                            "num_predict": 1200,
-                            "num_gpu": int(ollama_num_gpu),
-                        },
-                    }
-                    try:
-                        items = call_ollama_json_with_retry(
-                            ollama_ip=ollama_ip,
-                            payload=payload,
-                            timeout_sec=int(text_llm_timeout),
-                            retries=int(text_llm_retries),
-                        )
-                        for item in items:
-                            if isinstance(item, dict):
-                                all_results.append(item)
-                    except Exception as llm_err:
-                        st.error(f"LLM extraction failed: {llm_err}")
+                payload = {
+                    "model": selected_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {
+                        "temperature": 0,
+                        "num_predict": 1200,
+                        "num_gpu": int(ollama_num_gpu),
+                    },
+                }
+                try:
+                    items = call_ollama_json_with_retry(
+                        ollama_ip=ollama_ip,
+                        payload=payload,
+                        timeout_sec=int(text_llm_timeout),
+                        retries=int(text_llm_retries),
+                    )
+                    for item in items:
+                        if isinstance(item, dict):
+                            all_results.append(item)
+                except Exception as llm_err:
+                    st.error(f"LLM extraction failed: {llm_err}")
 
             if all_results:
                 df = pd.DataFrame(all_results)
