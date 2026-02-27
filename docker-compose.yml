@@ -6,3 +6,7 @@ services:
     ports:
       - "8501:8501"
     restart: unless-stopped
+    environment:
+      # Required for Streamlit WebSocket to work behind Synology reverse proxy
+      - STREAMLIT_SERVER_ENABLE_CORS=false
+      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
