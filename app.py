@@ -1,16 +1,10 @@
 import os
 import re
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import streamlit as st
-
-try:
-    import tkinter as tk
-    from tkinter import filedialog
-except Exception:
-    tk = None
-    filedialog = None
 
 try:
     from pdf2image import convert_from_path
@@ -66,26 +60,6 @@ def detect_compute():
     except Exception:
         pass
     return "cpu", 0
-
-
-# ---------------------------------------------------------------------------
-# File picker
-# ---------------------------------------------------------------------------
-
-def select_pdf_files():
-    if tk is None or filedialog is None:
-        st.error("tkinter is not available in this environment.")
-        return []
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    files_selected = filedialog.askopenfilenames(
-        master=root,
-        title="Select PDF files",
-        filetypes=[("PDF files", "*.pdf")],
-    )
-    root.destroy()
-    return list(files_selected)
 
 
 # ---------------------------------------------------------------------------
@@ -429,88 +403,89 @@ with st.sidebar:
     use_ocr_cache = st.checkbox("Cache OCR result per PDF", value=True)
     page_workers = st.slider("Page parallel workers", min_value=1, max_value=8, value=4, step=1)
 
-# Main page
-if st.button("Select PDF Files"):
-    files = select_pdf_files()
-    if files:
-        st.session_state["selected_pdfs"] = files
+# Main page — file uploader (works in headless containers, no display required)
+if "tmp_dir" not in st.session_state:
+    st.session_state["tmp_dir"] = tempfile.mkdtemp()
 
-selected_pdfs = st.session_state.get("selected_pdfs", [])
-if selected_pdfs:
-    st.info(f"{len(selected_pdfs)} PDF(s) selected:\n" + "\n".join(f"- `{os.path.basename(p)}`" for p in selected_pdfs))
-else:
-    st.info("No PDF files selected.")
+uploaded = st.file_uploader("Upload PDF Files", type="pdf", accept_multiple_files=True)
+
+# Save each uploaded file to the session temp dir so the rest of the code
+# can use normal file paths.
+pdf_files = []
+if uploaded:
+    for uf in uploaded:
+        dst = os.path.join(st.session_state["tmp_dir"], uf.name)
+        with open(dst, "wb") as f:
+            f.write(uf.getbuffer())
+        pdf_files.append(dst)
+    st.info(f"{len(pdf_files)} PDF(s) ready:\n" + "\n".join(f"- `{os.path.basename(p)}`" for p in pdf_files))
 
 if st.button("Run Extraction", type="primary"):
-    if not selected_pdfs:
-        st.error("Please select at least one PDF file first.")
+    if not pdf_files:
+        st.error("Please upload at least one PDF file first.")
     else:
-        pdf_files = [p for p in selected_pdfs if os.path.exists(p)]
-        if not pdf_files:
-            st.warning("None of the selected PDF files could be found.")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        all_results = []
+
+        paddle_ocr = load_paddle_ocr(use_gpu=(compute_device == "cuda"))
+        if paddle_ocr is None:
+            st.error("PaddleOCR failed to load. Check installation: pip install paddleocr")
+            st.stop()
+
+        for idx, pdf in enumerate(pdf_files):
+            filename = os.path.basename(pdf)
+            status_text.text(f"Processing ({idx + 1}/{len(pdf_files)}): {filename}")
+
+            try:
+                if use_ocr_cache:
+                    lines = ocr_pdf_to_lines_cached(
+                        pdf,
+                        _pdf_signature(pdf),
+                        poppler_path=st.session_state.get("poppler_path") or None,
+                        ocr_dpi=ocr_dpi,
+                        max_pages=max_pages,
+                        max_workers=page_workers,
+                        force_ocr=force_ocr,
+                    )
+                else:
+                    lines = extract_pdf_lines_hybrid(
+                        pdf,
+                        poppler_path=st.session_state.get("poppler_path") or None,
+                        ocr_dpi=ocr_dpi,
+                        max_pages=max_pages,
+                        max_workers=page_workers,
+                        force_ocr=force_ocr,
+                        paddle_ocr=paddle_ocr,
+                    )
+
+                records = extract_interest_from_lines(lines, filename)
+                all_results.extend(records)
+
+            except Exception as e:
+                st.error(f"Error in {filename}: {e}")
+
+            progress_bar.progress((idx + 1) / len(pdf_files))
+
+        status_text.empty()
+
+        if all_results:
+            df = pd.DataFrame(all_results)
+            df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+
+            st.success(f"Extraction completed — {len(df)} interest record(s) found.")
+            st.subheader("Interest Records")
+            st.dataframe(df, use_container_width=True)
+
+            total = df["amount"].sum()
+            st.metric("Total Interest", f"{total:,.2f}")
+
+            csv_data = df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="Download CSV",
+                data=csv_data,
+                file_name="interest_summary.csv",
+                mime="text/csv",
+            )
         else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            all_results = []
-
-            paddle_ocr = load_paddle_ocr(use_gpu=(compute_device == "cuda"))
-            if paddle_ocr is None:
-                st.error("PaddleOCR failed to load. Check installation: pip install paddleocr")
-                st.stop()
-
-            for idx, pdf in enumerate(pdf_files):
-                filename = os.path.basename(pdf)
-                status_text.text(f"Processing ({idx + 1}/{len(pdf_files)}): {filename}")
-
-                try:
-                    if use_ocr_cache:
-                        lines = ocr_pdf_to_lines_cached(
-                            pdf,
-                            _pdf_signature(pdf),
-                            poppler_path=st.session_state.get("poppler_path"),
-                            ocr_dpi=ocr_dpi,
-                            max_pages=max_pages,
-                            max_workers=page_workers,
-                            force_ocr=force_ocr,
-                        )
-                    else:
-                        lines = extract_pdf_lines_hybrid(
-                            pdf,
-                            poppler_path=st.session_state.get("poppler_path"),
-                            ocr_dpi=ocr_dpi,
-                            max_pages=max_pages,
-                            max_workers=page_workers,
-                            force_ocr=force_ocr,
-                            paddle_ocr=paddle_ocr,
-                        )
-
-                    records = extract_interest_from_lines(lines, filename)
-                    all_results.extend(records)
-
-                except Exception as e:
-                    st.error(f"Error in {filename}: {e}")
-
-                progress_bar.progress((idx + 1) / len(pdf_files))
-
-            status_text.empty()
-
-            if all_results:
-                df = pd.DataFrame(all_results)
-                df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
-
-                st.success(f"Extraction completed — {len(df)} interest record(s) found.")
-                st.subheader("Interest Records")
-                st.dataframe(df, use_container_width=True)
-
-                total = df["amount"].sum()
-                st.metric("Total Interest", f"{total:,.2f}")
-
-                csv_data = df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    label="Download CSV",
-                    data=csv_data,
-                    file_name="interest_summary.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.warning("No interest records found.")
+            st.warning("No interest records found.")
