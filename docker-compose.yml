@@ -1,6 +1,7 @@
 services:
   bankchecker:
-    build: .
+    build:
+      context: https://github.com/stephenyctsedev/bankchecker.git
     container_name: bank-statement-checker
     ports:
       - "8501:8501"
