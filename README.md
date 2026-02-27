@@ -2,6 +2,8 @@
 
 A Streamlit web app that extracts interest credit transactions from bank PDF statements using text extraction and OCR — no LLM required.
 
+**Live demo:** https://bankchecker.sharecloud-me.synology.me
+
 ## How it works
 
 1. Upload one or more PDF bank statements
