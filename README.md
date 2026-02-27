@@ -44,9 +44,11 @@ Open `http://localhost:8501` in your browser.
 
 ## Docker / Synology NAS deployment
 
-Poppler is included in the Docker image — no extra configuration needed.
+Poppler is included in the Docker image — no extra configuration needed. The image is built directly from the GitHub repository — no local source files required.
 
 ### Build and run with Docker Compose
+
+Download only the `docker-compose.yml` file, then run:
 
 ```bash
 docker compose up -d --build
@@ -56,7 +58,7 @@ Open `http://<host-ip>:8501`.
 
 ### Synology Container Manager
 
-1. Copy the project folder to your NAS (e.g. `/docker/bankchecker/`) via File Station
+1. Download `docker-compose.yml` to your NAS (e.g. `/docker/bankchecker/`) via File Station
 2. Open **Container Manager → Project → Create**
 3. Set the path to `/docker/bankchecker/`
 4. Click **Build** — Container Manager detects `docker-compose.yml` automatically
