@@ -21,7 +21,7 @@ COPY app.py .
 
 EXPOSE 8501
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"
 
 CMD ["streamlit", "run", "app.py", \
