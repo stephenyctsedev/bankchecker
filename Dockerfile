@@ -4,12 +4,10 @@ FROM python:3.10-slim-bookworm
 # Note: libgl1-mesa-glx was replaced by libgl1 in Debian bookworm+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils \
-        libglib2.0-0 \
-        libgl1 \
-        libsm6 \
-        libxext6 \
-        libxrender1 \
-        libgomp1 \
+        tesseract-ocr \
+        tesseract-ocr-eng \
+        tesseract-ocr-chi-sim \
+        tesseract-ocr-chi-tra \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
