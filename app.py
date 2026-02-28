@@ -103,9 +103,9 @@ def _render_single_page_image(pdf_path, page_index, dpi=150, poppler_path=None):
 # Tesseract OCR
 # ---------------------------------------------------------------------------
 
-def _paddle_ocr_image_to_lines(image, paddle_ocr):
+def _tesseract_image_to_lines(image, tesseract_ocr):
     """Run Tesseract OCR on a PIL image; returns list of text lines or None on failure."""
-    if paddle_ocr is None:
+    if tesseract_ocr is None:
         return None
     try:
         text = _pytesseract.image_to_string(image, lang="chi_tra+chi_sim+eng")
@@ -116,7 +116,7 @@ def _paddle_ocr_image_to_lines(image, paddle_ocr):
         return None
 
 
-def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages=0, max_workers=4, force_ocr=False, paddle_ocr=None):
+def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages=0, max_workers=4, force_ocr=False, tesseract_ocr=None):
     if pdfium is not None:
         doc = pdfium.PdfDocument(pdf_path)
         page_count = len(doc)
@@ -160,17 +160,17 @@ def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages
 
     for page_idx in sorted(ocr_needed_pages):
         img = _render_single_page_image(pdf_path, page_idx, dpi=ocr_dpi, poppler_path=poppler_path)
-        paddle_lines = _paddle_ocr_image_to_lines(img, paddle_ocr)
-        if paddle_lines is not None:
-            joined = "\n".join(paddle_lines)
+        ocr_lines = _tesseract_image_to_lines(img, tesseract_ocr)
+        if ocr_lines is not None:
+            joined = "\n".join(ocr_lines)
             if _is_substantial_text(joined) and not _is_gibberish_text(joined):
-                print(f"[OCR] Page {page_idx + 1}: used PaddleOCR ({len(paddle_lines)} lines)")
-                results[page_idx] = paddle_lines
+                print(f"[OCR] Page {page_idx + 1}: used Tesseract ({len(ocr_lines)} lines)")
+                results[page_idx] = ocr_lines
                 continue
             else:
-                print(f"[OCR] Page {page_idx + 1}: PaddleOCR output insufficient, page skipped")
+                print(f"[OCR] Page {page_idx + 1}: Tesseract output insufficient, page skipped")
         else:
-            print(f"[OCR] Page {page_idx + 1}: PaddleOCR unavailable/failed, page skipped")
+            print(f"[OCR] Page {page_idx + 1}: Tesseract unavailable/failed, page skipped")
         results[page_idx] = []
 
     lines = []
@@ -180,7 +180,7 @@ def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages
 
 
 @st.cache_resource(show_spinner=False)
-def load_paddle_ocr(use_gpu=False):
+def load_tesseract_ocr(use_gpu=False):
     if _pytesseract is None:
         print("[OCR] pytesseract not installed")
         return None
@@ -205,7 +205,7 @@ def ocr_pdf_to_lines_cached(
 ):
     _ = pdf_signature
     device, _ = detect_compute()
-    paddle_ocr = load_paddle_ocr(use_gpu=(device == "cuda"))
+    tesseract_ocr = load_tesseract_ocr(use_gpu=(device == "cuda"))
     return extract_pdf_lines_hybrid(
         pdf_path,
         poppler_path=poppler_path,
@@ -213,7 +213,7 @@ def ocr_pdf_to_lines_cached(
         max_pages=max_pages,
         max_workers=max_workers,
         force_ocr=force_ocr,
-        paddle_ocr=paddle_ocr,
+        tesseract_ocr=tesseract_ocr,
     )
 
 
@@ -354,7 +354,7 @@ with st.sidebar:
     force_ocr = st.checkbox(
         "Force OCR (skip text extraction)",
         value=False,
-        help="Always use PaddleOCR on every page. Useful for scanned or complex-layout PDFs.",
+        help="Always use Tesseract OCR on every page. Useful for scanned or complex-layout PDFs.",
     )
     use_ocr_cache = st.checkbox("Cache OCR result per PDF", value=True)
     page_workers = st.slider("Page parallel workers", min_value=1, max_value=8, value=4, step=1)
@@ -384,8 +384,8 @@ if st.button("Run Extraction", type="primary"):
         status_text = st.empty()
         all_results = []
 
-        paddle_ocr = load_paddle_ocr(use_gpu=(compute_device == "cuda"))
-        if paddle_ocr is None:
+        tesseract_ocr = load_tesseract_ocr(use_gpu=(compute_device == "cuda"))
+        if tesseract_ocr is None:
             st.error("Tesseract OCR is not available. Ensure tesseract-ocr is installed in the container.")
             st.stop()
 
@@ -412,7 +412,7 @@ if st.button("Run Extraction", type="primary"):
                         max_pages=max_pages,
                         max_workers=page_workers,
                         force_ocr=force_ocr,
-                        paddle_ocr=paddle_ocr,
+                        tesseract_ocr=tesseract_ocr,
                     )
 
                 records = extract_interest_from_lines(lines, filename)
