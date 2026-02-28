@@ -12,6 +12,10 @@ A Streamlit web app that extracts interest credit transactions from bank PDF sta
 4. Date and amount are parsed directly from the matched line
 5. Results are displayed in a table and available as CSV download
 
+## Privacy
+
+Uploaded PDFs are **deleted from the server immediately after extraction completes** — no bank statements are stored at rest. Files exist on the server only for the duration of processing (typically a few seconds).
+
 ## Supported formats
 
 | Bank | Date format | Example line |
@@ -27,12 +31,15 @@ Amount detection: the **second-to-last** decimal number on the line is taken as 
 
 - Python 3.10+
 - [Poppler](https://github.com/oschwartz10612/poppler-windows/releases/) (Windows: download and set path in sidebar)
+- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) (Windows: install binary and add to PATH)
 
 ### Install
 
 ```bash
 pip install -r requirements.txt
 ```
+
+> **Note:** PaddlePaddle from PyPI requires a CPU with AVX2 support. Most modern desktop/laptop CPUs support AVX2. For NAS or older CPUs without AVX2, use the Docker deployment below — the Dockerfile installs the correct no-AVX2 build automatically.
 
 ### Run
 
@@ -44,7 +51,10 @@ Open `http://localhost:8501` in your browser.
 
 ## Docker / Synology NAS deployment
 
-Poppler is included in the Docker image — no extra configuration needed.
+The Docker image handles all dependencies automatically:
+- **Poppler** and **Tesseract OCR** (English + Traditional/Simplified Chinese) via apt
+- **PaddlePaddle (no-AVX2)** installed from the official PaddlePaddle no-AVX2 wheel index — compatible with Synology NAS CPUs (Intel Celeron J-series) that do not support AVX2
+- **PaddleOCR** installed after PaddlePaddle
 
 ### Build and run with Docker Compose
 
@@ -71,8 +81,26 @@ Open `http://<host-ip>:8501`.
 3. Set the path to `/docker/bankchecker/`
 4. Click **Build** — Container Manager detects `docker-compose.yml` automatically
 
-> First build takes several minutes (PaddlePaddle + PaddleOCR are ~1 GB).
+> First build takes several minutes (PaddleOCR models are downloaded on first use).
 > Subsequent restarts are fast.
+
+### Synology reverse proxy (HTTPS)
+
+If serving via Synology's reverse proxy over HTTPS, enable **WebSocket** in the reverse proxy rule:
+
+> **Application Portal → Reverse Proxy → your rule → Edit → enable WebSocket**
+
+The destination should be `http://localhost:8501` (plain HTTP — TLS is terminated by the proxy).
+
+### Verify PaddleOCR installation
+
+After the container starts, run the built-in verification script:
+
+```bash
+docker exec bank-statement-checker python verify_ocr.py
+```
+
+This checks PaddlePaddle import, no-AVX2 wheel provenance, PaddleOCR import, and runs a test inference.
 
 ## Sidebar settings
 
@@ -92,6 +120,7 @@ Open `http://<host-ip>:8501`.
 | pdfplumber | Digital PDF text extraction (preserves column order) |
 | pypdfium2 | PDF page rendering for OCR |
 | pdf2image | PDF to image conversion (requires Poppler) |
-| paddleocr 2.7.3 | OCR for scanned pages |
-| paddlepaddle 2.6.2 | PaddleOCR backend |
+| paddleocr | OCR for scanned pages (Traditional/Simplified Chinese + English) |
+| paddlepaddle | PaddleOCR backend — no-AVX2 build used in Docker for NAS compatibility |
+| pytesseract | Fallback OCR engine (requires Tesseract binary) |
 | pandas | Result table and CSV export |
