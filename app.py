@@ -19,13 +19,9 @@ try:
 except Exception:
     pdfplumber = None
 try:
-    from paddleocr import PaddleOCR as _PaddleOCR
+    import pytesseract as _pytesseract
 except Exception:
-    _PaddleOCR = None
-try:
-    import torch
-except Exception:
-    torch = None
+    _pytesseract = None
 
 st.set_page_config(page_title="Bank Statement Interest Checker", page_icon="PDF", layout="wide")
 
@@ -48,13 +44,6 @@ _DECIMAL_RE = re.compile(r"[\d,]+\.\d+")
 # ---------------------------------------------------------------------------
 
 def detect_compute():
-    if torch is None:
-        return "cpu", 0
-    try:
-        if torch.cuda.is_available():
-            return "cuda", 1
-    except Exception:
-        pass
     return "cpu", 0
 
 
@@ -111,27 +100,19 @@ def _render_single_page_image(pdf_path, page_index, dpi=150, poppler_path=None):
 
 
 # ---------------------------------------------------------------------------
-# PaddleOCR
+# Tesseract OCR
 # ---------------------------------------------------------------------------
 
 def _paddle_ocr_image_to_lines(image, paddle_ocr):
-    """Run PaddleOCR on a PIL image; returns list of text lines or None on failure."""
+    """Run Tesseract OCR on a PIL image; returns list of text lines or None on failure."""
     if paddle_ocr is None:
         return None
     try:
-        import numpy as np
-        result = paddle_ocr.ocr(np.array(image), cls=True)
-        if not result or not result[0]:
-            return []
-        lines = []
-        for line in result[0]:
-            if line and len(line) >= 2:
-                text = line[1][0] if isinstance(line[1], (list, tuple)) else ""
-                if text:
-                    lines.append(str(text))
+        text = _pytesseract.image_to_string(image, lang="chi_tra+chi_sim+eng")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         return lines
     except Exception as e:
-        print(f"[OCR] PaddleOCR inference error: {e}")
+        print(f"[OCR] Tesseract error: {e}")
         return None
 
 
@@ -200,30 +181,16 @@ def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages
 
 @st.cache_resource(show_spinner=False)
 def load_paddle_ocr(use_gpu=False):
-    if _PaddleOCR is None:
+    if _pytesseract is None:
+        print("[OCR] pytesseract not installed")
         return None
-    gpu_variants = (
-        [{"device": "gpu"}, {"use_gpu": True}] if use_gpu else []
-    ) + [{}]
-    base_options = [
-        {"use_textline_orientation": True, "lang": "en"},  # PaddleOCR 3.x
-        {"use_angle_cls": True, "lang": "en"},             # PaddleOCR 2.x
-        {"lang": "en"},                                    # minimal fallback
-    ]
-    last_err = None
-    for base in base_options:
-        for extra in gpu_variants:
-            try:
-                ocr = _PaddleOCR(**base, **extra)
-                print(f"[OCR] PaddleOCR loaded — base={base} gpu={extra or 'auto'}")
-                return ocr
-            except TypeError:
-                continue
-            except Exception as e:
-                last_err = e
-                break
-    print(f"[OCR] PaddleOCR failed to load: {last_err}")
-    return None
+    try:
+        _pytesseract.get_tesseract_version()
+        print("[OCR] Tesseract OCR ready")
+        return True
+    except Exception as e:
+        print(f"[OCR] Tesseract not available: {e}")
+        return None
 
 
 @st.cache_data(show_spinner=False)
@@ -419,7 +386,7 @@ if st.button("Run Extraction", type="primary"):
 
         paddle_ocr = load_paddle_ocr(use_gpu=(compute_device == "cuda"))
         if paddle_ocr is None:
-            st.error("PaddleOCR failed to load. Check installation: pip install paddleocr")
+            st.error("Tesseract OCR is not available. Ensure tesseract-ocr is installed in the container.")
             st.stop()
 
         for idx, pdf in enumerate(pdf_files):
@@ -457,6 +424,13 @@ if st.button("Run Extraction", type="primary"):
             progress_bar.progress((idx + 1) / len(pdf_files))
 
         status_text.empty()
+
+        # Delete uploaded PDFs from server immediately after processing
+        for pdf in pdf_files:
+            try:
+                os.remove(pdf)
+            except Exception:
+                pass
 
         if all_results:
             df = pd.DataFrame(all_results)

@@ -7,10 +7,14 @@ A Streamlit web app that extracts interest credit transactions from bank PDF sta
 ## How it works
 
 1. Upload one or more PDF bank statements
-2. Text is extracted via **pdfplumber** (for digital PDFs) or **PaddleOCR** (for scanned/image-based PDFs)
+2. Text is extracted via **pdfplumber** (for digital PDFs) or **Tesseract OCR** (for scanned/image-based PDFs)
 3. Lines containing interest keywords (`INTEREST`, `利息`, `INT`) are matched by regex
 4. Date and amount are parsed directly from the matched line
 5. Results are displayed in a table and available as CSV download
+
+## Privacy
+
+Uploaded PDFs are **deleted from the server immediately after extraction completes** — no bank statements are stored at rest. Files exist on the server only for the duration of processing (typically a few seconds).
 
 ## Supported formats
 
@@ -27,6 +31,8 @@ Amount detection: the **second-to-last** decimal number on the line is taken as 
 
 - Python 3.10+
 - [Poppler](https://github.com/oschwartz10612/poppler-windows/releases/) (Windows: download and set path in sidebar)
+- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) (Windows: install the UB-Mannheim binary and ensure it is on your PATH or use the default install location `C:\Program Files\Tesseract-OCR\`)
+  - During installation, select **Additional language data → Chinese (Simplified)** and **Chinese (Traditional)**
 
 ### Install
 
@@ -44,7 +50,9 @@ Open `http://localhost:8501` in your browser.
 
 ## Docker / Synology NAS deployment
 
-Poppler is included in the Docker image — no extra configuration needed.
+The Docker image handles all dependencies automatically:
+- **Poppler** and **Tesseract OCR** (English + Traditional/Simplified Chinese) installed via apt
+- No large ML model downloads — Tesseract works immediately after the image is built
 
 ### Build and run with Docker Compose
 
@@ -71,8 +79,16 @@ Open `http://<host-ip>:8501`.
 3. Set the path to `/docker/bankchecker/`
 4. Click **Build** — Container Manager detects `docker-compose.yml` automatically
 
-> First build takes several minutes (PaddlePaddle + PaddleOCR are ~1 GB).
-> Subsequent restarts are fast.
+> First build takes a minute or two (system packages are installed via apt).
+> Subsequent restarts are fast — no model downloads.
+
+### Synology reverse proxy (HTTPS)
+
+If serving via Synology's reverse proxy over HTTPS, enable **WebSocket** in the reverse proxy rule:
+
+> **Application Portal → Reverse Proxy → your rule → Edit → enable WebSocket**
+
+The destination should be `http://localhost:8501` (plain HTTP — TLS is terminated by the proxy).
 
 ## Sidebar settings
 
@@ -80,7 +96,7 @@ Open `http://<host-ip>:8501`.
 |---------|-------------|
 | Poppler Path | Windows only — path to Poppler `bin/` directory. Leave empty in Docker. |
 | Max pages per PDF | Limit pages processed (0 = all). Useful for large statements. |
-| Force OCR | Skip text extraction and always use PaddleOCR (for fully scanned PDFs). |
+| Force OCR | Skip text extraction and always use Tesseract OCR (for fully scanned PDFs). |
 | Cache OCR result | Cache extracted text per PDF to avoid re-processing on rerun. |
 | Page parallel workers | Number of threads for simultaneous page text extraction. |
 
@@ -90,8 +106,7 @@ Open `http://<host-ip>:8501`.
 |---------|---------|
 | streamlit | Web UI |
 | pdfplumber | Digital PDF text extraction (preserves column order) |
-| pypdfium2 | PDF page rendering for OCR |
+| pypdfium2 | PDF page rendering for OCR fallback |
 | pdf2image | PDF to image conversion (requires Poppler) |
-| paddleocr 2.7.3 | OCR for scanned pages |
-| paddlepaddle 2.6.2 | PaddleOCR backend |
+| pytesseract | OCR for scanned pages (requires Tesseract binary) |
 | pandas | Result table and CSV export |

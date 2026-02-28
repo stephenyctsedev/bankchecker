@@ -1,15 +1,14 @@
 FROM python:3.10-slim-bookworm
 
-# System packages: poppler for pdf2image, libGL for PaddleOCR/OpenCV
-# Note: libgl1-mesa-glx was replaced by libgl1 in Debian bookworm+
+# System packages:
+#   poppler-utils  — pdf2image PDF rendering
+#   tesseract-ocr  — OCR engine for scanned PDFs
 RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils \
-        libglib2.0-0 \
-        libgl1 \
-        libsm6 \
-        libxext6 \
-        libxrender1 \
-        libgomp1 \
+        tesseract-ocr \
+        tesseract-ocr-eng \
+        tesseract-ocr-chi-sim \
+        tesseract-ocr-chi-tra \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -21,11 +20,10 @@ COPY app.py .
 
 EXPOSE 8501
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"
-
 CMD ["streamlit", "run", "app.py", \
      "--server.port=8501", \
      "--server.address=0.0.0.0", \
      "--server.headless=true", \
+     "--server.enableCORS=false", \
+     "--server.enableXsrfProtection=false", \
      "--browser.gatherUsageStats=false"]
