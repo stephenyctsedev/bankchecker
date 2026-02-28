@@ -442,6 +442,13 @@ if st.button("Run Extraction", type="primary"):
 
         status_text.empty()
 
+        # Delete uploaded PDFs from server immediately after processing
+        for pdf in pdf_files:
+            try:
+                os.remove(pdf)
+            except Exception:
+                pass
+
         if all_results:
             df = pd.DataFrame(all_results)
             df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
