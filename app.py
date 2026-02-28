@@ -25,7 +25,7 @@ except Exception:
 
 st.set_page_config(page_title="Bank Statement Interest Checker", page_icon="PDF", layout="wide")
 
-# Month abbreviations used by Bangkok Bank date format (e.g. 01MAR24)
+# Month abbreviations used by HKBea date format (e.g. 01MAR24)
 _MONTH_MAP = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
@@ -225,12 +225,12 @@ def _parse_date(token: str):
     """
     Try to parse a single token as a date.
     Supports:
-      - Bangkok Bank format: DDMMMYY  e.g. 01MAR24
+      - HKBea format: DDMMMYY  e.g. 01MAR24
       - Citibank format:     MM/DD/YY or MM/DD/YYYY  e.g. 01/31/24
       - Firstrade format:    MM/DD/YYYY  e.g. 01/31/2024  (same slash pattern, 4-digit year)
     Returns 'YYYY-MM-DD' string or None.
     """
-    # Bangkok Bank: 01MAR24
+    # HKBea: 01MAR24
     m = re.fullmatch(r"(\d{2})([A-Z]{3})(\d{2})", token, re.IGNORECASE)
     if m:
         day, mon, yr = m.groups()
@@ -256,7 +256,7 @@ def _extract_description(line: str) -> str:
     for _ in range(2):
         s = re.sub(r"^\d{2}[A-Z]{3}\d{2}\s*", "", s, flags=re.IGNORECASE)
         s = re.sub(r"^\d{1,2}/\d{1,2}/\d{2,4}\s*", "", s)
-    # Remove leading 4-digit time/reference code (Bangkok Bank "0000")
+    # Remove leading 4-digit time/reference code (HKBea "0000")
     s = re.sub(r"^\d{4}\s+", "", s)
     # Remove trailing two decimal numbers (amount + running balance)
     s = re.sub(r"\s+[\d,]+\.\d+\s+[\d,]+\.\d+\s*$", "", s)
@@ -271,7 +271,7 @@ def extract_interest_from_lines(lines: list, filename: str) -> list:
     No LLM required.
 
     Line formats handled:
-      Bangkok Bank: 01MAR24 0000 INTEREST 利息收入 6.76 9,728.25
+      HKBea: 01MAR24 0000 INTEREST 利息收入 6.76 9,728.25
       Citibank:     01/31/24 01/31/24 存入利息 (JAN) 16.62 19,678.26
       Firstrade:    01/31/2024 INTEREST ON CREDIT BALANCE 5.25
                     01/31/2024 INTEREST ON CREDIT BALANCE 5.25 10,234.56
