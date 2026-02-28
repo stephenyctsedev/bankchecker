@@ -1,8 +1,8 @@
 streamlit>=1.32.0
 pandas
 numpy
-paddleocr==2.7.3
-paddlepaddle==2.6.2
+paddleocr==2.6.1
+paddlepaddle==2.5.2
 pdf2image
 pypdfium2
 pdfplumber
