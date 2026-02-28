@@ -227,6 +227,7 @@ def _parse_date(token: str):
     Supports:
       - Bangkok Bank format: DDMMMYY  e.g. 01MAR24
       - Citibank format:     MM/DD/YY or MM/DD/YYYY  e.g. 01/31/24
+      - Firstrade format:    MM/DD/YYYY  e.g. 01/31/2024  (same slash pattern, 4-digit year)
     Returns 'YYYY-MM-DD' string or None.
     """
     # Bangkok Bank: 01MAR24
@@ -236,7 +237,7 @@ def _parse_date(token: str):
         month = _MONTH_MAP.get(mon.upper())
         if month:
             return f"20{yr}-{month:02d}-{int(day):02d}"
-    # Citibank: 01/31/24 or 01/31/2024
+    # Citibank / Firstrade: 01/31/24 or 01/31/2024
     m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", token)
     if m:
         mm, dd, yr = m.groups()
@@ -272,6 +273,13 @@ def extract_interest_from_lines(lines: list, filename: str) -> list:
     Line formats handled:
       Bangkok Bank: 01MAR24 0000 INTEREST 利息收入 6.76 9,728.25
       Citibank:     01/31/24 01/31/24 存入利息 (JAN) 16.62 19,678.26
+      Firstrade:    01/31/2024 INTEREST ON CREDIT BALANCE 5.25
+                    01/31/2024 INTEREST ON CREDIT BALANCE 5.25 10,234.56
+
+      NOTE — Firstrade format: if only one decimal is present the line has no
+      running-balance column; the single value is the transaction amount.
+      If two decimals are present, the second-to-last is the amount.
+      Verify against an actual Firstrade statement and adjust if needed.
 
     Strategy:
       - Only decimal numbers (e.g. 6.76, 9,728.25) are collected — this avoids
