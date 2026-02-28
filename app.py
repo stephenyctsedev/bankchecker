@@ -3,13 +3,8 @@ import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-
-# Suppress PaddlePaddle connectivity check to avoid slow startup when
-# model hoster endpoints are unreachable.
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 try:
     from pdf2image import convert_from_path
@@ -105,26 +100,19 @@ def _render_single_page_image(pdf_path, page_index, dpi=150, poppler_path=None):
 
 
 # ---------------------------------------------------------------------------
-# PaddleOCR
+# Tesseract OCR
 # ---------------------------------------------------------------------------
 
 def _paddle_ocr_image_to_lines(image, paddle_ocr):
-    """Run PaddleOCR on a PIL image; returns list of text lines or None on failure."""
+    """Run Tesseract OCR on a PIL image; returns list of text lines or None on failure."""
     if paddle_ocr is None:
         return None
     try:
-        result = paddle_ocr.ocr(np.array(image), cls=True)
-        if not result or not result[0]:
-            return []
-        lines = []
-        for line in result[0]:
-            if line and len(line) >= 2:
-                text = line[1][0] if isinstance(line[1], (list, tuple)) else ""
-                if text:
-                    lines.append(str(text))
+        text = _pytesseract.image_to_string(image, lang="chi_tra+chi_sim+eng")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         return lines
     except Exception as e:
-        print(f"[OCR] PaddleOCR inference error: {e}")
+        print(f"[OCR] Tesseract error: {e}")
         return None
 
 
@@ -193,13 +181,15 @@ def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages
 
 @st.cache_resource(show_spinner=False)
 def load_paddle_ocr(use_gpu=False):
+    if _pytesseract is None:
+        print("[OCR] pytesseract not installed")
+        return None
     try:
-        from paddleocr import PaddleOCR as _PaddleOCR
-        ocr = _PaddleOCR(use_angle_cls=True, lang="ch")
-        print("[OCR] PaddleOCR 2.x initialized successfully")
-        return ocr
+        _pytesseract.get_tesseract_version()
+        print("[OCR] Tesseract OCR ready")
+        return True
     except Exception as e:
-        print(f"[OCR] PaddleOCR not available: {e}")
+        print(f"[OCR] Tesseract not available: {e}")
         return None
 
 
@@ -396,7 +386,7 @@ if st.button("Run Extraction", type="primary"):
 
         paddle_ocr = load_paddle_ocr(use_gpu=(compute_device == "cuda"))
         if paddle_ocr is None:
-            st.error("PaddleOCR is not available. Ensure paddlepaddle (no-AVX2) and paddleocr are installed and models are downloaded.")
+            st.error("Tesseract OCR is not available. Ensure tesseract-ocr is installed in the container.")
             st.stop()
 
         for idx, pdf in enumerate(pdf_files):
