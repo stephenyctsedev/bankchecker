@@ -7,4 +7,4 @@ pypdfium2
 pdfplumber
 # PaddleOCR — PaddlePaddle (no-AVX2) is installed separately in the Dockerfile
 # via: pip install paddlepaddle -f https://www.paddlepaddle.org.cn/whl/linux/cpu-noavx/stable.html
-paddleocr
+paddleocr==2.7.3

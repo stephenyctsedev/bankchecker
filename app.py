@@ -113,20 +113,18 @@ def _paddle_ocr_image_to_lines(image, paddle_ocr):
     if paddle_ocr is None:
         return None
     try:
-        img_array = np.array(image.convert("RGB"))
-        results = paddle_ocr.predict(img_array)
+        result = paddle_ocr.ocr(np.array(image), cls=True)
+        if not result or not result[0]:
+            return []
         lines = []
-        for page_res in results:
-            if not page_res:
-                continue
-            rec_texts = page_res.get("rec_text", [])
-            for text in rec_texts:
-                text = (text or "").strip()
+        for line in result[0]:
+            if line and len(line) >= 2:
+                text = line[1][0] if isinstance(line[1], (list, tuple)) else ""
                 if text:
-                    lines.append(text)
+                    lines.append(str(text))
         return lines
     except Exception as e:
-        print(f"[OCR] PaddleOCR error: {e}")
+        print(f"[OCR] PaddleOCR inference error: {e}")
         return None
 
 
@@ -196,14 +194,9 @@ def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages
 @st.cache_resource(show_spinner=False)
 def load_paddle_ocr(use_gpu=False):
     try:
-        from paddleocr import PaddleOCR
-        ocr = PaddleOCR(
-            lang="ch",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-        )
-        print("[OCR] PaddleOCR initialized successfully")
+        from paddleocr import PaddleOCR as _PaddleOCR
+        ocr = _PaddleOCR(use_angle_cls=True, lang="ch")
+        print("[OCR] PaddleOCR 2.x initialized successfully")
         return ocr
     except Exception as e:
         print(f"[OCR] PaddleOCR not available: {e}")
