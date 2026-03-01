@@ -7,7 +7,7 @@ A Streamlit web app that extracts interest credit transactions from bank PDF sta
 ## How it works
 
 1. Upload one or more PDF bank statements
-2. Text is extracted via **pdfplumber** (for digital PDFs) or **Tesseract OCR** (for scanned/image-based PDFs)
+2. Text is extracted via **pdfplumber** (for digital PDFs) or **RapidOCR** (for scanned/image-based PDFs)
 3. Lines containing interest keywords (`INTEREST`, `利息`, `INT`) are matched by regex
 4. Date and amount are parsed directly from the matched line
 5. Results are displayed in a table and available as CSV download
@@ -31,8 +31,6 @@ Amount detection: the **second-to-last** decimal number on the line is taken as 
 
 - Python 3.10+
 - [Poppler](https://github.com/oschwartz10612/poppler-windows/releases/) (Windows: download and set path in sidebar)
-- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) (Windows: install the UB-Mannheim binary and ensure it is on your PATH or use the default install location `C:\Program Files\Tesseract-OCR\`)
-  - During installation, select **Additional language data → Chinese (Simplified)** and **Chinese (Traditional)**
 
 ### Install
 
@@ -51,8 +49,8 @@ Open `http://localhost:8501` in your browser.
 ## Docker / Synology NAS deployment
 
 The Docker image handles all dependencies automatically:
-- **Poppler** and **Tesseract OCR** (English + Traditional/Simplified Chinese) installed via apt
-- No large ML model downloads — Tesseract works immediately after the image is built
+- **Poppler** installed via apt; **RapidOCR** installed via pip (ONNX models downloaded on first run)
+- No heavy ML framework needed — RapidOCR uses ONNX Runtime, which supports any x86_64 CPU
 
 ### Build and run with Docker Compose
 
@@ -96,7 +94,7 @@ The destination should be `http://localhost:8501` (plain HTTP — TLS is termina
 |---------|-------------|
 | Poppler Path | Windows only — path to Poppler `bin/` directory. Leave empty in Docker. |
 | Max pages per PDF | Limit pages processed (0 = all). Useful for large statements. |
-| Force OCR | Skip text extraction and always use Tesseract OCR (for fully scanned PDFs). |
+| Force OCR | Skip text extraction and always use RapidOCR (for fully scanned PDFs). |
 | Cache OCR result | Cache extracted text per PDF to avoid re-processing on rerun. |
 | Page parallel workers | Number of threads for simultaneous page text extraction. |
 
@@ -108,5 +106,5 @@ The destination should be `http://localhost:8501` (plain HTTP — TLS is termina
 | pdfplumber | Digital PDF text extraction (preserves column order) |
 | pypdfium2 | PDF page rendering for OCR fallback |
 | pdf2image | PDF to image conversion (requires Poppler) |
-| pytesseract | OCR for scanned pages (requires Tesseract binary) |
+| rapidocr-onnxruntime | OCR for scanned pages via ONNX Runtime (no system OCR package needed) |
 | pandas | Result table and CSV export |

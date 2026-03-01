@@ -19,9 +19,9 @@ try:
 except Exception:
     pdfplumber = None
 try:
-    import pytesseract as _pytesseract
+    from rapidocr_onnxruntime import RapidOCR as _RapidOCR
 except Exception:
-    _pytesseract = None
+    _RapidOCR = None
 
 st.set_page_config(page_title="Bank Statement Interest Checker", page_icon="PDF", layout="wide")
 
@@ -100,19 +100,21 @@ def _render_single_page_image(pdf_path, page_index, dpi=150, poppler_path=None):
 
 
 # ---------------------------------------------------------------------------
-# Tesseract OCR
+# RapidOCR
 # ---------------------------------------------------------------------------
 
 def _tesseract_image_to_lines(image, tesseract_ocr):
-    """Run Tesseract OCR on a PIL image; returns list of text lines or None on failure."""
+    """Run RapidOCR on a PIL image; returns list of text lines or None on failure."""
     if tesseract_ocr is None:
         return None
     try:
-        text = _pytesseract.image_to_string(image, lang="chi_tra+chi_sim+eng")
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        result, _ = tesseract_ocr(image)
+        if not result:
+            return []
+        lines = [item[1].strip() for item in result if item[1].strip()]
         return lines
     except Exception as e:
-        print(f"[OCR] Tesseract error: {e}")
+        print(f"[OCR] RapidOCR error: {e}")
         return None
 
 
@@ -164,13 +166,13 @@ def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages
         if ocr_lines is not None:
             joined = "\n".join(ocr_lines)
             if _is_substantial_text(joined) and not _is_gibberish_text(joined):
-                print(f"[OCR] Page {page_idx + 1}: used Tesseract ({len(ocr_lines)} lines)")
+                print(f"[OCR] Page {page_idx + 1}: used RapidOCR ({len(ocr_lines)} lines)")
                 results[page_idx] = ocr_lines
                 continue
             else:
-                print(f"[OCR] Page {page_idx + 1}: Tesseract output insufficient, page skipped")
+                print(f"[OCR] Page {page_idx + 1}: RapidOCR output insufficient, page skipped")
         else:
-            print(f"[OCR] Page {page_idx + 1}: Tesseract unavailable/failed, page skipped")
+            print(f"[OCR] Page {page_idx + 1}: RapidOCR unavailable/failed, page skipped")
         results[page_idx] = []
 
     lines = []
@@ -181,15 +183,15 @@ def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages
 
 @st.cache_resource(show_spinner=False)
 def load_tesseract_ocr(use_gpu=False):
-    if _pytesseract is None:
-        print("[OCR] pytesseract not installed")
+    if _RapidOCR is None:
+        print("[OCR] rapidocr-onnxruntime not installed")
         return None
     try:
-        _pytesseract.get_tesseract_version()
-        print("[OCR] Tesseract OCR ready")
-        return True
+        ocr = _RapidOCR()
+        print("[OCR] RapidOCR ready")
+        return ocr
     except Exception as e:
-        print(f"[OCR] Tesseract not available: {e}")
+        print(f"[OCR] RapidOCR init failed: {e}")
         return None
 
 
@@ -386,7 +388,7 @@ if st.button("Run Extraction", type="primary"):
 
         tesseract_ocr = load_tesseract_ocr(use_gpu=(compute_device == "cuda"))
         if tesseract_ocr is None:
-            st.error("Tesseract OCR is not available. Ensure tesseract-ocr is installed in the container.")
+            st.error("RapidOCR is not available. Ensure rapidocr-onnxruntime is installed.")
             st.stop()
 
         for idx, pdf in enumerate(pdf_files):
