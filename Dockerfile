@@ -3,9 +3,11 @@ FROM python:3.10-slim-bookworm
 # System packages:
 #   poppler-utils  — pdf2image PDF rendering
 #   libgomp1       — OpenMP runtime required by onnxruntime
+#   libgl1         — OpenGL runtime required by opencv (used by rapidocr)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils \
         libgomp1 \
+        libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
