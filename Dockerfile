@@ -1,13 +1,19 @@
 FROM python:3.10-slim-bookworm
 
 # System packages:
-#   poppler-utils  — pdf2image PDF rendering
-#   libgomp1       — OpenMP runtime required by onnxruntime
-#   libgl1         — OpenGL runtime required by opencv (used by rapidocr)
+#   poppler-utils           — pdf2image PDF rendering
+#   libgomp1                — OpenMP runtime required by onnxruntime
+#   libgl1, libglib2.0-0,   — opencv-python runtime dependencies
+#   libsm6, libxext6,         (required by rapidocr-onnxruntime)
+#   libxrender1
 RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils \
         libgomp1 \
         libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
