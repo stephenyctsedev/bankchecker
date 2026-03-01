@@ -176,6 +176,21 @@ def extract_pdf_lines_hybrid(pdf_path, poppler_path=None, ocr_dpi=150, max_pages
     lines = []
     for i in range(page_count):
         lines.extend(results.get(i, []))
+
+    # Debug: print every extracted line so you can inspect the raw format
+    # (e.g. when checking a new bank like Firstrade for the first time).
+    # Each line is tagged [RAW LINE p<page>] in server stdout.
+    page_boundaries = []
+    offset = 0
+    for i in range(page_count):
+        page_lines = results.get(i, [])
+        page_boundaries.append((i, offset, offset + len(page_lines)))
+        offset += len(page_lines)
+
+    for page_idx, start, end in page_boundaries:
+        for ln_idx, ln in enumerate(lines[start:end], start=1):
+            print(f"[RAW LINE p{page_idx + 1}:{ln_idx}] {ln!r}")
+
     return lines
 
 
