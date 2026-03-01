@@ -20,7 +20,8 @@ except Exception:
     pdfplumber = None
 try:
     from rapidocr_onnxruntime import RapidOCR as _RapidOCR
-except Exception:
+except Exception as _rapidocr_import_err:
+    print(f"[OCR] rapidocr_onnxruntime import failed: {_rapidocr_import_err}")
     _RapidOCR = None
 
 st.set_page_config(page_title="Bank Statement Interest Checker", page_icon="PDF", layout="wide")
