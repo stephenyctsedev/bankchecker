@@ -39,6 +39,13 @@ _INTEREST_RE = re.compile(r"INTEREST|利息|INT\b", re.IGNORECASE)
 # Using only decimal numbers avoids false positives from integer date parts (01, 31, 24)
 _DECIMAL_RE = re.compile(r"[\d,]+\.\d+")
 
+# Broader pattern used for blur search (fallback after two strict checks fail).
+# Catches partial keywords, Chinese characters, and common credit-related terms.
+_BLUR_INTEREST_RE = re.compile(
+    r"INT(?:EREST)?|利|息|CRED(?:IT)?|EARN|YIELD|SAV(?:ING)?|INCOME|收入|存入|DIVIDEND|BONUS|RETURN",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Compute detection
@@ -324,6 +331,58 @@ def extract_interest_from_lines(lines: list, filename: str) -> list:
     return results
 
 
+def extract_interest_blur(lines: list, filename: str) -> list:
+    """
+    Blur (fuzzy) fallback search used when two strict extraction passes find
+    no interest records.
+
+    Uses a broader keyword set (_BLUR_INTEREST_RE) to surface any line that
+    *might* contain an interest-like credit.  Date is optional — lines without
+    a recognised date token are still included (date field left blank).
+
+    Returns at most one candidate per unique amount so we don't flood the
+    results with duplicates.
+    """
+    results = []
+    seen_amounts: set = set()
+    for line in lines:
+        if not _BLUR_INTEREST_RE.search(line):
+            continue
+
+        raw_nums = _DECIMAL_RE.findall(line)
+        nums = []
+        for n in raw_nums:
+            try:
+                nums.append(float(n.replace(",", "")))
+            except ValueError:
+                pass
+        if not nums:
+            continue
+
+        amount = nums[-2] if len(nums) >= 2 else nums[-1]
+        if amount in seen_amounts:
+            continue
+        seen_amounts.add(amount)
+
+        date_str = ""
+        for token in line.split():
+            d = _parse_date(token)
+            if d:
+                date_str = d
+                break
+
+        description = _extract_description(line)
+        print(f"[BLUR] {filename} | date={date_str} | amount={amount} | desc={description!r}")
+        results.append({
+            "source": filename,
+            "date": date_str,
+            "description": description,
+            "amount": amount,
+            "blur_match": True,
+        })
+    return results
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -397,28 +456,48 @@ if st.button("Run Extraction", type="primary"):
             status_text.text(f"Processing ({idx + 1}/{len(pdf_files)}): {filename}")
 
             try:
+                common_kwargs = dict(
+                    poppler_path=st.session_state.get("poppler_path") or None,
+                    ocr_dpi=ocr_dpi,
+                    max_pages=max_pages,
+                    max_workers=page_workers,
+                )
+
+                # ── Check 1: normal extraction (pdfplumber → OCR fallback) ──
                 if use_ocr_cache:
                     lines = ocr_pdf_to_lines_cached(
-                        pdf,
-                        _pdf_signature(pdf),
-                        poppler_path=st.session_state.get("poppler_path") or None,
-                        ocr_dpi=ocr_dpi,
-                        max_pages=max_pages,
-                        max_workers=page_workers,
-                        force_ocr=force_ocr,
+                        pdf, _pdf_signature(pdf), force_ocr=force_ocr, **common_kwargs
                     )
                 else:
                     lines = extract_pdf_lines_hybrid(
-                        pdf,
-                        poppler_path=st.session_state.get("poppler_path") or None,
-                        ocr_dpi=ocr_dpi,
-                        max_pages=max_pages,
-                        max_workers=page_workers,
-                        force_ocr=force_ocr,
-                        tesseract_ocr=tesseract_ocr,
+                        pdf, force_ocr=force_ocr, tesseract_ocr=tesseract_ocr, **common_kwargs
                     )
-
                 records = extract_interest_from_lines(lines, filename)
+
+                if not records:
+                    # ── Check 2: force full OCR re-extraction ──
+                    status_text.text(
+                        f"Processing ({idx + 1}/{len(pdf_files)}): {filename} — check 2 (force OCR)…"
+                    )
+                    lines2 = extract_pdf_lines_hybrid(
+                        pdf, force_ocr=True, tesseract_ocr=tesseract_ocr, **common_kwargs
+                    )
+                    records = extract_interest_from_lines(lines2, filename)
+                    # Use the richer line set for a potential blur search
+                    lines = lines2
+
+                if not records:
+                    # ── Blur search: broader keyword matching on all extracted lines ──
+                    status_text.text(
+                        f"Processing ({idx + 1}/{len(pdf_files)}): {filename} — blur search…"
+                    )
+                    records = extract_interest_blur(lines, filename)
+                    if records:
+                        st.warning(
+                            f"⚠️ **{filename}**: no exact interest keywords found after two checks. "
+                            f"Showing {len(records)} candidate row(s) from blur search — please verify manually."
+                        )
+
                 all_results.extend(records)
 
             except Exception as e:
@@ -438,8 +517,16 @@ if st.button("Run Extraction", type="primary"):
         if all_results:
             df = pd.DataFrame(all_results)
             df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+            # Normalise blur_match column: fill missing (exact matches) with False
+            if "blur_match" in df.columns:
+                df["blur_match"] = df["blur_match"].fillna(False)
+            else:
+                df["blur_match"] = False
 
-            st.success(f"Extraction completed — {len(df)} interest record(s) found.")
+            exact_count = int((~df["blur_match"]).sum())
+            blur_count = int(df["blur_match"].sum())
+            label = f"Extraction completed — {exact_count} exact + {blur_count} blur candidate(s) found."
+            st.success(label)
             st.subheader("Interest Records")
             st.dataframe(df, use_container_width=True)
 

@@ -1,7 +1,6 @@
 services:
   bankchecker:
-    build:
-      context: .
+    image: ghcr.io/stephenyctsedev/bankchecker:latest
     container_name: bank-statement-checker
     ports:
       - "8501:8501"
